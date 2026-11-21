@@ -36,6 +36,7 @@ CONSUMER_LEVEL = os.environ.get("CONSUMER_LEVEL", "1") == "1"
 ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "1") == "1"
 WM_LEVEL = os.environ.get("WM_LEVEL", "1") == "1"
 LAMBDA_LEVEL = os.environ.get("LAMBDA_LEVEL", "1") == "1"
+AR_LEVEL = os.environ.get("AR_LEVEL", "1") == "1"
 ESC_BUDGET = float(os.environ.get("ESC_BUDGET", "0.4"))  # CPU seconds for one import-time escalation
 LINE_LEVEL = os.environ.get("LINE_LEVEL", "1") == "1"
 RUN_MAX_SECONDS = float(os.environ.get("RUN_MAX_SECONDS", "1.0"))  # run tests cheaper than this
@@ -88,6 +89,12 @@ class Map:
         self._S_cache = {}
         self.import_lambdas = set(m["import_lambdas"]) if "import_lambdas" in m else None
         self.tpcds_rt_raw = m.get("tpcds_rt")
+        self.ar = m.get("ar")
+        if self.ar:
+            number = {t["id"]: t["number"] for t in tests}
+            self.ar_remap = [number.get(i) for i in self.ar["ids"]]
+            self.ar_import = set(self.ar["import"])
+            self.ar_names = set(self.ar["names"]) - set(self.ar["dyn"])
         self._tpcds_rt = None
         self.wm = m.get("wm")
         if self.wm:
@@ -116,6 +123,12 @@ class Map:
                     return None
                 out |= us
         return out
+
+    def ar_readers(self, key):
+        sid = self.ar["read"].get(key)
+        if sid is None:
+            return set()
+        return {self.ar_remap[i] for i in self.ar["sets"][sid] if self.ar_remap[i] is not None}
 
     def tpcds_rt(self):
         """query index -> {rel: set(lines run outside optimize())} for the TPC-DS executor test."""
@@ -402,6 +415,34 @@ def func_header(node):
     return dump(n)
 
 
+def needs_reimport(mp, rel, fn):
+    """Swapping fn.__code__ in place cannot reach closures/lambdas fn already created: if fn defines
+    nested functions and ran while importing, the child must re-import the module to verify."""
+    nested = any(isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
+                 for s in fn.body for x in ast.walk(s))
+    if any("cache" in dump(d).lower() or "memo" in dump(d).lower() for d in fn.decorator_list):
+        return True  # results computed with the old code may be cached
+    if not nested:
+        return False
+    lo, hi = node_range(fn)
+    return mp.import_time(rel, lo, hi) or not mp.imp.get(rel)
+
+
+def defaults_only(on, nn):
+    """The two headers differ only in constant default values (evaluated once, read by callers)."""
+    import copy
+    a, b = on.args, nn.args
+    da = list(a.defaults) + [d for d in a.kw_defaults if d is not None]
+    db = list(b.defaults) + [d for d in b.kw_defaults if d is not None]
+    if len(da) != len(db) or not all(isinstance(d, ast.Constant) for d in da + db):
+        return False
+    c1, c2 = copy.deepcopy(on), copy.deepcopy(nn)
+    for c in (c1, c2):
+        c.args.defaults = [ast.Constant(value=None) for _ in c.args.defaults]
+        c.args.kw_defaults = [None if d is None else ast.Constant(value=None) for d in c.args.kw_defaults]
+    return func_header(c1) == func_header(c2)
+
+
 def func_body(node):
     return [dump(s) for s in strip_doc(node.body)]
 
@@ -480,6 +521,15 @@ def class_key(rel, qual):
 
 _OPS = ["Lt", "LtE", "Gt", "GtE", "Eq", "NotEq", "Is", "IsNot", "In", "NotIn"]
 _IS_EQ = {"Is", "IsNot", "Eq", "NotEq"}
+_ORDER_OR_EQUAL = frozenset({"Lt", "LtE", "Gt", "GtE", "Eq", "NotEq"})
+# Exactly the alternatives tools/wm_plugin.py records (its ALTS table); anything else: no data.
+_PROFILED_ALTERNATIVES = {
+    **dict.fromkeys(("Lt", "LtE", "Gt", "GtE"), _ORDER_OR_EQUAL),
+    **dict.fromkeys(("Eq", "NotEq"), _ORDER_OR_EQUAL | {"Is", "IsNot"}),
+    **dict.fromkeys(("Is", "IsNot"), _IS_EQ),
+    "In": {"NotIn"},
+    "NotIn": {"In"},
+}
 PERF_SENSITIVE = ("::test_max_nodes", "::test_generator_memory")
 
 
@@ -514,7 +564,7 @@ def weak_mutation_tests(mp, rel, on, nn):
     out, lines = set(), set()
     for node, old, new in swaps:
         key = "%s:%d:%d" % (rel, node.lineno, node.col_offset)
-        if new not in _OPS:
+        if new not in _PROFILED_ALTERNATIVES.get(old, ()) or new == old:
             return None
         imask = wm["import"].get(key, 0)
         if imask & (1 << _OPS.index(new)) or imask & (1 << 15):
@@ -804,8 +854,11 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
             continue  # identical apart from comments / docstring
         lo, hi = node_range(on)
         body_only = func_header(on) == func_header(nn)
-        if not body_only or any("cache" in dump(d).lower() or "memo" in dump(d).lower() for d in on.decorator_list):
+        if (not body_only and not defaults_only(on, nn)) or \
+                any("cache" in dump(d).lower() or "memo" in dump(d).lower() for d in on.decorator_list):
             an.non_body = True
+        elif not body_only:
+            an.body_lines.append((rel, set(range(lo, hi + 1))))
         n_body = len(an.body_lines)
         precise = False
         if body_only and WM_LEVEL and mp.wm:
@@ -815,7 +868,10 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
                 an.add(tests_wm, "lines-wm " + k)
                 an.line_sets.append((rel, lines_wm))
                 an.body_lines.append((rel, set(lines_wm)))
-                an.swap.setdefault(mod, []).append(k)
+                if needs_reimport(mp, rel, on):
+                    an.reimport = True
+                else:
+                    an.swap.setdefault(mod, []).append(k)
                 continue
         if body_only and fp is not None and LINE_LEVEL:
             qual = k
@@ -847,6 +903,8 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
             an.non_body = True
             import_time_escalation(an, rel, k, on, o[1], 0)
         if func_header(on) == func_header(nn):
+            if needs_reimport(mp, rel, on):
+                an.reimport = True
             an.swap.setdefault(mod, []).append(k)
     for k in set(oc) | set(nc):
         o = oc.get(k)
@@ -1100,7 +1158,7 @@ def mention_word_tests(mp, word):
         rx = re.compile(r"\b%s\b" % re.escape(word))
         hits = set()
         for f, src in _test_sources.items():
-            if rx.search(src):
+            if word in src and rx.search(src):
                 hits |= set(mp.by_file[f])
         _word_cache[word] = hits
     return _word_cache[word]
@@ -1344,6 +1402,12 @@ def class_change(an, rel, qual, oc, why, stmts=None, old_stmts=()):
             if dangerous or len(attrs) > 40:
                 dangerous = True
                 break
+    ar_res = None
+    if attrs and AR_LEVEL and mp.ar and stmts:
+        ar_res = ar_class_readers(an, rel, qual, key, attrs, stmts, old_stmts)
+        if ar_res is not None and (dangerous or not ATTR_LEVEL):
+            an.add(ar_res, "ar-readers " + qual + " " + ",".join(sorted(attrs)))
+            return
     if attrs and ATTR_LEVEL and not dangerous:
         narrowed = set()
         for a in attrs:
@@ -1351,6 +1415,13 @@ def class_change(an, rel, qual, oc, why, stmts=None, old_stmts=()):
         # the changed lines themselves (lambdas in dict literals run at test time)
         for st in old_stmts:
             narrowed |= mp.cover(rel, st.lineno, st.end_lineno)
+        if ar_res is not None:
+            # both are supersets of the affected tests: so is their intersection
+            stmt_cover = set()
+            for st in old_stmts:
+                stmt_cover |= mp.cover(rel, st.lineno, st.end_lineno)
+            an.add(ar_res & ((users & narrowed) | stmt_cover), "ar-readers&attr " + qual + " " + ",".join(sorted(attrs)))
+            return
         an.add(users & narrowed, "class-attr-users " + qual + " " + ",".join(sorted(attrs)))
         for st in old_stmts:
             an.add(mp.cover(rel, st.lineno, st.end_lineno), "class-stmt-cover")
@@ -1379,6 +1450,32 @@ def class_change(an, rel, qual, oc, why, stmts=None, old_stmts=()):
         class_change(an, rel, qual.rsplit(".", 1)[0], oc, "outer of " + qual)
     if not found and not users:
         module_change(an, rel, None, None, oc, None, None, "class without recorded users " + qual)
+
+
+def ar_class_readers(an, rel, qual, key, attrs, stmts, old_stmts):
+    """Tests that read one of `attrs` resolving to class `key` (or via super()) while running,
+    from the attribute-read profile; None when the profile cannot decide."""
+    mp = an.mp
+    old_ids = {id(s) for s in old_stmts}
+    new_stmts = [s for s in stmts if id(s) not in old_ids]
+    t_old = simple_assign_targets(list(old_stmts))
+    t_new = simple_assign_targets(new_stmts)
+    if not t_old or t_old != t_new:
+        return None  # attributes added or removed: lookups elsewhere in the MRO change
+    if any(isinstance(s, ast.AugAssign) for s in stmts):
+        return None
+    out = set()
+    for a in attrs:
+        if a not in mp.ar_names:
+            return None
+        k = "%s|%s" % (key, a)
+        if k in mp.ar_import or ("*|" + a) in mp.ar_import:
+            return None  # consumed while modules import (derived state)
+        out |= mp.ar_readers(k) | mp.ar_readers("*|" + a)
+        out |= mention_word_tests(mp, a)  # test code reads it directly (not instrumented)
+    for st in old_stmts:  # lambdas inside the changed statements run at test time
+        out |= mp.cover(rel, st.lineno, st.end_lineno)
+    return out
 
 
 def _copies(an, rel, qual, stmts):
@@ -2375,7 +2472,7 @@ def read_all(pid):
 # --------------------------------------------------------------------------- packing
 # Scoring machines charge ~2.8x the CPU of the machine cpu.json was measured on
 # (two practice submissions: server CPU / local CPU on the same work).
-CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "2.8"))
+CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "1.9"))  # measured: 4.1 s local -> +7.5 s charged
 RUN_OVERHEAD_MS = float(os.environ.get("RUN_OVERHEAD_MS", "60"))
 NEVER_RUN_MS = float(os.environ.get("NEVER_RUN_MS", "15000"))
 P_ANY = float(os.environ.get("P_ANY", "0.75"))
@@ -2616,17 +2713,7 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
-def _calibration_work(n=64_000_000):
-    """Fixed amount of pure-Python work (about 4.0 CPU seconds on the dev machine). Used once to
-    measure how the scoring machines charge CPU relative to local measurements; removed after."""
-    x = 0
-    for i in range(n):
-        x = (x * 1103515245 + 12345) & 0x7fffffff
-    return x
-
-
 def main():
-    _calibration_work()
     out = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)  # anything else printed to stdout goes to stderr
     sys.stdout = sys.stderr

@@ -14,8 +14,10 @@ def _ser(node, out):
         if node.comments:
             out.append(" #" + repr(node.comments))
         m = getattr(node, "_meta", None)
-        if m:
-            out.append(" @" + repr(sorted((k, repr(v)) for k, v in m.items())))
+        if m is not None:
+            # "nonnull" is an optimizer-only hint: no line of the executor's runtime phase reads it
+            out.append(" @" + repr(sorted((k, repr(v)) for k, v in m.items()
+                                          if not (k == "nonnull" and isinstance(v, bool)))))
         for k, v in node.args.items():
             out.append(" " + k + "=")
             _ser(v, out)
