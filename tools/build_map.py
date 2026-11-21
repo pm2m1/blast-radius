@@ -155,7 +155,25 @@ def closure(m_):
             if y not in seen: seen.add(y); st.append(y)
     return sorted(seen)
 importers = {m_: closure(m_) for m_ in mods}
-out["units"] = {b: {f: {str(l): sorted(u) for l, u in lm.items()} for f, lm in per.items()} for b, per in units.items()}
+# per-unit (query / fixture case) coverage, only for tests expensive enough to filter
+cpu_costs = json.load(open("cpu.json"))["test"] if os.path.exists("cpu.json") else {}
+secs = {t["id"]: t["seconds"] for t in tests}
+usets = []; usid = {}
+def US(s):
+    k = tuple(sorted(s))
+    if k not in usid: usid[k] = len(usets); usets.append(list(k))
+    return usid[k]
+out_units = {}
+for b, per in units.items():
+    if secs.get(b, 0) < 0.9 and cpu_costs.get(b, 0) < 900:
+        continue
+    names = sorted({u for lm in per.values() for us in lm.values() for u in us})
+    ix = {n: i for i, n in enumerate(names)}
+    out_units[b] = {"names": names,
+                    "lines": {f: {str(l): US({ix[u] for u in us}) for l, us in lm.items()} for f, lm in per.items()}}
+out["units"] = out_units
+out["usets"] = usets
+print("units for", sorted(out_units), file=sys.stderr)
 out["import_inst"] = json.load(open("import_inst.json"))
 out.update({"name_tests": name_tests, "name_refs": name_refs, "importers": importers, "sets": sets})
 blob = json.dumps(out, separators=(",", ":")).encode()

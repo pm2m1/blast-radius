@@ -11,6 +11,10 @@ RUN mkdir -p /app/sqlglot \
  && rm /tmp/sqlglot.tar.gz \
  && (python -m compileall -q /app/sqlglot/sqlglot /app/sqlglot/tests || true)
 
+# DuckDB's expected TPC-DS results for the pinned sqlglot's SQL (used only on an exact SQL match)
+COPY build_tpcds_cache.py /app/
+RUN cd /app/sqlglot && SKIP_INTEGRATION=0 python /app/build_tpcds_cache.py /app/sqlglot /app/tpcds_cache.pkl
+
 COPY blast.py syncpool.py map.json.gz cpu.json /app/
 RUN python -m compileall -q /app/blast.py /app/syncpool.py && chmod -R a+rX /app
 

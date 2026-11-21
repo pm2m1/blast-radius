@@ -119,6 +119,51 @@ def _install_unit_hooks():
             with orig_sub(self, msg, **params):
                 yield
     unittest.TestCase.subTest = subTest
+    _install_fixture_hooks()
+
+
+_fx = {"titles": {}}
+
+
+def _install_fixture_hooks():
+    """Per fixture-case coverage for tests that loop over load_sql_fixture_pairs (optimizer check_file):
+    context nodeid@c:<file>:<i> while case i is set up and optimized, and inside subTest(<title>)."""
+    import unittest, contextlib
+    import tests.test_optimizer as to
+    orig = to.load_sql_fixture_pairs
+
+    def load_sql_fixture_pairs(filename):
+        c = _state["ctx"]
+        if not c or "|" in c:
+            yield from orig(filename)
+            return
+        base = c.split("@")[0]
+        for i, item in enumerate(orig(filename), start=1):
+            meta, sql, expected = item
+            unit = "c:%s:%d" % (filename, i)
+            _fx["titles"][(base, meta.get("title") or f"{i}, {sql}")] = unit
+            _switch(base + "@" + unit)
+            yield item
+        _switch(base + "@post")
+    to.load_sql_fixture_pairs = load_sql_fixture_pairs
+    prev_sub = unittest.TestCase.subTest
+
+    @contextlib.contextmanager
+    def subTest(self, msg=None, **params):
+        c = _state["ctx"]
+        base = c.split("@")[0] if c and "|" not in c else None
+        unit = _fx["titles"].get((base, msg)) if (base and isinstance(msg, str)) else None
+        if unit:
+            _switch(base + "@" + unit)
+            try:
+                with prev_sub(self, msg, **params):
+                    yield
+            finally:
+                _switch(base + "@post")
+        else:
+            with prev_sub(self, msg, **params):
+                yield
+    unittest.TestCase.subTest = subTest
 
 
 def _switch(ctx):

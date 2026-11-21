@@ -30,6 +30,7 @@ REPO = os.environ.get("SQLGLOT_DIR", "/app/sqlglot")
 DATA = os.environ.get("DATA_DIR", "/data")
 MAP_PATH = os.environ.get("MAP_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "map.json.gz"))
 MEASURE = os.environ.get("MEASURE") == "1"
+CONSUMER_LEVEL = os.environ.get("CONSUMER_LEVEL", "1") == "1"
 ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "1") == "1"
 LINE_LEVEL = os.environ.get("LINE_LEVEL", "1") == "1"
 RUN_MAX_SECONDS = float(os.environ.get("RUN_MAX_SECONDS", "1.0"))  # run tests cheaper than this
@@ -39,8 +40,14 @@ PARALLEL = int(os.environ.get("PARALLEL", "2"))
 DEBUG = os.environ.get("SELECT_DEBUG") == "1"
 T0 = time.time()
 real_io_open = io.open
+TPCDS_CACHE = os.environ.get("TPCDS_CACHE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_cache.pkl"))
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "tests/conftest.py"}
+
+
+def _cpu():
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_utime + r.ru_stime
 
 
 def log(*a):
@@ -69,24 +76,31 @@ class Map:
         self._mro_rev = None
         number_of = {t["id"]: t["number"] for t in tests}
         self.units = {number_of[k]: v for k, v in m.get("units", {}).items() if k in number_of}
+        self.usets = m.get("usets", [])
         self.unit_test_nums = set(self.units)
 
     def affected_units(self, num, line_sets):
-        """Units of a unit test reached by the changed lines; None means all."""
-        per = self.units[num]
+        """Unit names (TPC-DS queries q<k>, fixture cases c:<file>:<i>) reached by the changed lines;
+        None means all of them."""
+        u = self.units[num]
+        names = u["names"]
         out = set()
         for rel, lines in line_sets:
-            lm = per.get(rel, {})
+            lm = u["lines"].get(rel, {})
             for ln in lines:
-                us = lm.get(str(ln))
-                if us is None:
+                sid = lm.get(str(ln))
+                if sid is None:
                     if num in self.cover(rel, ln, ln):
                         return None  # covered outside any unit
                     continue
+                us = {names[i] for i in self.usets[sid]}
                 if "post" in us:
                     return None
-                out.update(us)
+                out |= us
         return out
+
+    def unit_count(self, num):
+        return sum(1 for n in self.units[num]["names"] if n != "post")
 
     def S(self, sid):
         return {self.remap[i] for i in self.sets[sid] if self.remap[i] is not None}
@@ -142,8 +156,9 @@ class Map:
                 out |= self.S(sid)
                 found = True
         # dynamically created subclasses (e.g. inside tests) are recorded by qualname only
+        qual = key.split(":")[-1]
         for k, sid in self.m["inst"].items():
-            if k not in self.m["mro"] and k.split(":")[-1].endswith("." + key.split(":")[-1].split(".")[-1]):
+            if k not in self.m["mro"] and k.split(":")[-1] == qual:
                 out |= self.S(sid)
         return out, found
 
@@ -752,10 +767,141 @@ def importers_of_module(an, rel):
     return out
 
 
+
+_line_nodes = {}
+_STMT_FIELDS = ("body", "orelse", "handlers", "finalbody", "cases")
+
+
+def stmt_at(tree, line):
+    """Innermost statement whose range contains `line` (or None)."""
+    best = None
+    body = tree.body
+    while True:
+        nxt = None
+        for st in body:
+            if isinstance(st, ast.stmt) and st.lineno <= line <= st.end_lineno:
+                nxt = st
+                break
+            if isinstance(st, ast.ExceptHandler) and st.lineno <= line <= st.end_lineno:
+                nxt = st
+                break
+        if nxt is None:
+            return best
+        if isinstance(nxt, ast.stmt):
+            best = nxt
+        children = []
+        for f in _STMT_FIELDS:
+            v = getattr(nxt, f, None)
+            if isinstance(v, list):
+                children.extend(v)
+        if hasattr(nxt, "cases"):
+            for c in nxt.cases or []:
+                children.extend(c.body)
+        if not children:
+            return best
+        body = children
+
+
+def nodes_on_line(rel, tree, line):
+    """(node, parent, stmt) for expression nodes of the statement at `line` (not nested statements)."""
+    key = (rel, id(tree), line)
+    if key in _line_nodes:
+        return _line_nodes[key]
+    st = stmt_at(tree, line)
+    out = []
+    if st is not None:
+        stack = [(c, st) for f, v in ast.iter_fields(st) if f not in _STMT_FIELDS
+                 for c in (v if isinstance(v, list) else [v]) if isinstance(c, ast.AST)]
+        while stack:
+            n, par = stack.pop()
+            if isinstance(n, ast.stmt):
+                continue
+            if getattr(n, "lineno", None) is not None and n.lineno <= line <= (n.end_lineno or n.lineno):
+                out.append((n, par, st))
+            for c in ast.iter_child_nodes(n):
+                stack.append((c, n))
+    _line_nodes[key] = out
+    return out
+
+
+def consumer_tests(mp, name, seen=None, depth=0):
+    """Tests that execute a line *using* `name`'s value. Lines that only hand the value on
+    (x = self.NAME, f(k=self.NAME), self.k = k) are followed to the new name instead."""
+    if seen is None:
+        seen = set()
+    if name in seen:
+        return set()
+    seen.add(name)
+    refs = mp.name_refs(name)
+    if not refs or depth > 5 or name in GENERIC_NAMES or len(name) < 4:
+        return mp.name_tests(name)
+    out = set()
+    derived = set()
+    for f, lines in refs.items():
+        tree = old_tree_of(f)
+        if tree is None:
+            return mp.name_tests(name)
+        seen_nodes = set()
+        for ln in lines:
+          for node, par, st in nodes_on_line(f, tree, ln):
+            if id(node) in seen_nodes:
+                continue
+            if not ((isinstance(node, ast.Attribute) and node.attr == name and isinstance(node.ctx, ast.Load)) or
+                    (isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)) or
+                    (isinstance(node, ast.Constant) and node.value == name)):
+                continue
+            seen_nodes.add(id(node))
+            handed = None
+            if isinstance(par, ast.keyword) and par.arg:
+                handed = {par.arg}
+            elif isinstance(par, (ast.Assign, ast.AnnAssign)) and par.value is node:
+                tg = par.targets if isinstance(par, ast.Assign) else [par.target]
+                names = set()
+                for t in tg:
+                    if isinstance(t, ast.Name):
+                        names.add(t.id)
+                    elif isinstance(t, ast.Attribute):
+                        names.add(t.attr)
+                    else:
+                        names = None
+                        break
+                handed = names
+            if handed:
+                derived |= handed
+                continue
+            out |= mp.cover(f, st.lineno, st.end_lineno)
+    for d in derived:
+        out |= consumer_tests(mp, d, seen, depth + 1)
+    # tests that name it directly in test code
+    out |= mention_word_tests(mp, name)
+    return out
+
+
+_word_cache = {}
+
+
+def mention_word_tests(mp, word):
+    if word not in _word_cache:
+        mention_search(mp, "x/__none__")  # loads test sources
+        rx = re.compile(r"\b%s\b" % re.escape(word))
+        hits = set()
+        for f, src in _test_sources.items():
+            if rx.search(src):
+                hits |= set(mp.by_file[f])
+        _word_cache[word] = hits
+    return _word_cache[word]
+
+
+def _is_noop_stmt(st):
+    return isinstance(st, ast.Pass) or (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant))
+
+
 def simple_assign_targets(stmts):
     """Names assigned by plain class-body assignments, or None if any statement is something else."""
     names = set()
     for st in stmts:
+        if _is_noop_stmt(st):
+            continue
         if isinstance(st, ast.Assign):
             tg = st.targets
         elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
@@ -767,6 +913,36 @@ def simple_assign_targets(stmts):
                 return None
             names.add(t.id)
     return names
+
+
+_SAFE_CLASS_DECORATORS = {"trait", "mypyc_attr"}
+
+
+def narrowable_class(mp, rel, qual, oc, attrs):
+    """Attribute-level narrowing relies on the value being read by name. Python consumes some class
+    attributes implicitly: dunders (__slots__, __hash__, ...), enum members, dataclass fields."""
+    if any(a.startswith("__") and a.endswith("__") for a in attrs):
+        return False
+    node = oc.get(qual, (None,))[0]
+    parts = qual.split(".")
+    for i in range(len(parts), 0, -1):  # the class and its enclosing classes
+        n = oc.get(".".join(parts[:i]), (None,))[0]
+        if n is None:
+            continue
+        for d in n.decorator_list:
+            name = d.id if isinstance(d, ast.Name) else (d.func.id if isinstance(d, ast.Call) and isinstance(d.func, ast.Name) else
+                                                          getattr(getattr(d, "func", d), "attr", None))
+            if name not in _SAFE_CLASS_DECORATORS:
+                return False
+    if node is not None:
+        for b in node.bases:
+            bn = b.id if isinstance(b, ast.Name) else getattr(b, "attr", "")
+            if "Enum" in bn or bn in ("AutoName", "NamedTuple", "TypedDict"):
+                return False
+    mro = mp.m["mro"].get(class_key(rel, qual), [])
+    if any(m.endswith(":AutoName") for m in mro):
+        return False
+    return True
 
 
 def derived_closure(oc, qual, attrs, stmts):
@@ -911,8 +1087,9 @@ def read_at_import_in_code(mp, attr, cls_key=None, derived=None):
                 return True
             owner = q.rsplit(".", 1)[0] if "." in q else ""
             owner_node = scope_units(t)[1].get(owner, (None,))[0] if owner else None
-            is_meta = owner_node is not None and any(
-                (isinstance(b, ast.Name) and b.id == "type") for b in owner_node.bases)
+            is_meta = (owner_node is not None and any(
+                (isinstance(b, ast.Name) and b.id == "type") for b in owner_node.bases)) or \
+                nd.name in ("__init_subclass__", "__set_name__")
             if is_meta:
                 bad, der = meta_taint(nd, attr)
                 if bad:
@@ -931,6 +1108,10 @@ def class_change(an, rel, qual, oc, why, stmts=None, old_stmts=()):
     key = class_key(rel, qual)
     users, found = mp.class_users(key)
     attrs = simple_assign_targets(stmts) if stmts else None
+    if attrs is not None and not attrs:
+        attrs = None
+    if attrs and not narrowable_class(mp, rel, qual, oc, attrs):
+        attrs = None
     dangerous = False
     if attrs:
         attrs = derived_closure(oc, qual, attrs, stmts)
@@ -951,7 +1132,7 @@ def class_change(an, rel, qual, oc, why, stmts=None, old_stmts=()):
     if attrs and ATTR_LEVEL and not dangerous:
         narrowed = set()
         for a in attrs:
-            narrowed |= mp.name_tests(a)
+            narrowed |= consumer_tests(mp, a) if CONSUMER_LEVEL else mp.name_tests(a)
         # the changed lines themselves (lambdas in dict literals run at test time)
         for st in old_stmts:
             narrowed |= mp.cover(rel, st.lineno, st.end_lineno)
@@ -1004,7 +1185,7 @@ def _copies(an, rel, qual, stmts):
                 units = None
                 owners = set(qual.split("."))
                 for l in hits[:200]:
-                    if not reads_attr_of(t, l, n, owners):
+                    if not reads_attr_of(t, l, n, owners, f):
                         continue
                     kind, q, nd = enclosing(t, l)
                     if kind == "class" and not (f == rel and (q == qual or q.startswith(qual + "."))):
@@ -1020,26 +1201,22 @@ def _copies(an, rel, qual, stmts):
 _attr_cache = {}
 
 
-def reads_attr_of(tree, line, attr, owners):
+def reads_attr_of(tree, line, attr, owners, rel="?"):
     """Does `line` contain `<owner>.<attr>` (owner = changed class or its outer class)?"""
-    key = id(tree)
-    if key not in _attr_cache:
-        idx = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
-                v = node.value
-                name = v.id if isinstance(v, ast.Name) else (v.attr if isinstance(v, ast.Attribute) else None)
-                if name:
-                    per = idx.setdefault(node.attr, {})
-                    for ln in range(node.lineno, node.end_lineno + 1):
-                        per.setdefault(ln, set()).add(name)
-        _attr_cache[key] = idx
-    return bool(_attr_cache[key].get(attr, {}).get(line, set()) & owners)
+    for node, par, st in nodes_on_line(rel, tree, line):
+        if isinstance(node, ast.Attribute) and node.attr == attr:
+            v = node.value
+            name = v.id if isinstance(v, ast.Name) else (v.attr if isinstance(v, ast.Attribute) else None)
+            if name in owners:
+                return True
+    return False
 
 
 def module_simple_names(stmts):
     names = set()
     for st in stmts:
+        if _is_noop_stmt(st):
+            continue
         if isinstance(st, (ast.Import, ast.ImportFrom)):
             for a in st.names:
                 if a.name == "*":
@@ -1059,10 +1236,53 @@ def module_simple_names(stmts):
     return names
 
 
+def module_name_consumers(mp, rel, modname, name):
+    """Tests running lines that use module-level `name` of `rel`: in `rel` itself, or in modules that
+    import it from `rel` (other modules' same-named variables are different objects)."""
+    refs = mp.name_refs(name)
+    if not refs:
+        return mp.name_tests(name)
+    out = set()
+    for f, lines in refs.items():
+        t = old_tree_of(f)
+        if t is None:
+            return mp.name_tests(name)
+        if f != rel and not imports_name_from(t, modname, name):
+            continue
+        for ln in lines:
+            st = stmt_at(t, ln)
+            if st is not None:
+                out |= mp.cover(f, st.lineno, st.end_lineno)
+            else:
+                out |= mp.cover(f, ln, ln)
+    out |= mention_word_tests(mp, name)
+    return out
+
+
+def imports_name_from(tree, modname, name):
+    """Does this module import `name` from `modname` (or import the module itself)?"""
+    last = modname.rsplit(".", 1)[-1]
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom):
+            mod = n.module or ""
+            if mod == modname or (n.level and mod.endswith(last)) or modname.endswith("." + mod) and mod:
+                if any(a.name in (name, "*") for a in n.names):
+                    return True
+            parent = modname.rsplit(".", 1)[0]
+            if (mod == parent or (n.level and modname.endswith(mod))) and any(a.name == last for a in n.names):
+                return True
+        elif isinstance(n, ast.Import):
+            if any(a.name == modname or a.name.startswith(modname + ".") for a in n.names):
+                return True
+    return False
+
+
 def module_change(an, rel, old_tree, of, oc, os_, ns, why, stmts=None):
     mp = an.mp
     an.reimport = True
     names = module_simple_names(stmts) if (stmts and ATTR_LEVEL and old_tree is not None) else None
+    if names and any(n.startswith("__") and n.endswith("__") for n in names):
+        names = None
     if names and not (names & GENERIC_NAMES) and not rel.endswith("__init__.py") \
             and not any(read_at_import_in_code(mp, n) for n in names):
         # same-module derived constants (TRIE = new_trie(MAPPING))
@@ -1077,30 +1297,35 @@ def module_change(an, rel, old_tree, of, oc, os_, ns, why, stmts=None):
                         if isinstance(t, ast.Name) and t.id not in derived:
                             derived.add(t.id)
                             grow = True
+        modname0 = module_name(rel)
         for n in derived:
-            an.add(mp.name_tests(n), "module-name " + n)
+            an.add(module_name_consumers(mp, rel, modname0, n), "module-name " + n)
         old_set = {dump(x) for x in os_.get("", [])} if os_ else set()
         for st in stmts:
             if dump(st) in old_set and hasattr(st, "lineno"):
                 an.add(mp.cover(rel, st.lineno, st.end_lineno), "module-stmt-cover")
         # class bodies in this module that read the names at import time
         t = old_tree
+        modname = module_name(rel)
         for n in derived:
             for f, ls in mp.name_refs(n).items():
                 il = mp.imp.get(f, ())
                 tt = old_tree_of(f) if f != rel else t
                 if tt is None:
                     continue
+                if f != rel and not imports_name_from(tt, modname, n):
+                    continue
                 units = None
                 for l in ls:
                     if l not in il:
                         continue
                     kind, q, nd = enclosing(tt, l)
-                    if kind == "class" and (f, q) not in an.visited:
-                        an.visited.add((f, q))
+                    if kind == "class" and (f, q, l) not in an.visited:
+                        an.visited.add((f, q, l))
                         if units is None:
                             units = scope_units(tt)
-                        class_change(an, f, q, units[1], "reads module name " + n)
+                        body_st = [x for x in nd.body if x.lineno <= l <= x.end_lineno]
+                        class_change(an, f, q, units[1], "reads module name " + n, body_st, body_st)
         if rel.startswith("tests/"):
             an.add(mp.test_file_tests(rel), "test-module")
         return
@@ -1360,8 +1585,10 @@ def mention_search(mp, rel):
 class Runner:
     """Warm parent: sqlglot and every test module imported once. Each commit runs in a fork."""
 
-    def __init__(self, tests):
+    def __init__(self, tests, mp=None, plans=()):
         self.tests = tests
+        self.mp = mp
+        self.plans = plans
         self.by_number = {t["number"]: t for t in tests}
         os.environ.setdefault("SKIP_INTEGRATION", "0")
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1375,29 +1602,50 @@ class Runner:
         gc.freeze()  # children never scan the parent's objects (map, modules) in gc.collect()
 
     def warm(self):
+        """Import only what the planned runs need: their test modules (and so their libraries)
+        and the sqlglot modules that swap mode will patch in place."""
         import importlib
         import unittest  # noqa
         importlib.import_module("sqlglot")
-        mods = sorted({t["file"] for t in self.tests})
-        self.failed_imports = set()
-        for f in mods:
-            name = f[:-3].replace("/", ".")
+        if self.mp is None:  # tools: no plan, import everything
+            self.base_import_failures, self.failed_imports = set(), set()
+            for f in sorted({t["file"] for t in self.tests}):
+                try:
+                    importlib.import_module(f[:-3].replace("/", "."))
+                except Exception:
+                    self.failed_imports.add(f[:-3].replace("/", "."))
+            import pkgutil
+            import sqlglot
+            for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+                if not info.name.endswith("__main__"):
+                    try:
+                        importlib.import_module(info.name)
+                    except Exception:
+                        self.base_import_failures.add(info.name)
+            return
+        base_fail = self.mp.m.get("base_fail", {})
+        self.base_import_failures = set(base_fail.get("sqlglot", []))
+        self.failed_imports = {f[:-3].replace("/", ".") for f in base_fail.get("tests", [])}
+        mods = set()
+        swap_mods = set()
+        for p in self.plans:
+            for n in p["run"]:
+                mods.add(self.by_number[n]["file"][:-3].replace("/", "."))
+            if p["an"].swap and not p["an"].reimport:
+                swap_mods.update(p["an"].swap)
+        for name in sorted(mods):
+            if name in self.failed_imports:
+                continue
             try:
                 importlib.import_module(name)
             except Exception as e:
                 log("warm import failed", name, e)
                 self.failed_imports.add(name)
-        # all sqlglot modules (dialects are lazy) so swap mode can find functions
-        import pkgutil
-        import sqlglot
-        self.base_import_failures = set()
-        for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
-            if info.name.endswith("__main__"):
-                continue
+        for name in sorted(swap_mods):
             try:
-                importlib.import_module(info.name)
-            except Exception:
-                self.base_import_failures.add(info.name)
+                importlib.import_module(name)
+            except Exception as e:
+                log("warm swap import failed", name, e)
 
     # -- in the child -------------------------------------------------------
     @staticmethod
@@ -1534,20 +1782,85 @@ class Runner:
                 return None
         return None
 
-    def _filter_tpcds(self, module, units):
+    def _patch_tpcds(self, module, units):
+        """test_execute_tpcds in the child: optional query filter, early stop, and DuckDB results
+        reused when the patched sqlglot emits exactly the pinned DuckDB SQL."""
         keep = None
-        for n, us in units.items():
+        for n, us in (units or {}).items():
             if self.by_number[n]["id"].endswith("::test_execute_tpcds"):
-                keep = set(us)
-        if keep is None:
+                keep = {int(u[1:]) for u in us if u.startswith("q")}
+        if keep is not None:
+            orig = module.load_sql_fixture_pairs
+
+            def load_sql_fixture_pairs(filename):
+                items = list(orig(filename))
+                if "tpc-ds" in filename:
+                    return [x for i, x in enumerate(items) if i in keep]
+                return items
+            module.load_sql_fixture_pairs = load_sql_fixture_pairs
+
+        cache = {}
+        try:
+            import pickle
+            with real_io_open(TPCDS_CACHE, "rb") as f:
+                cache = pickle.load(f)
+        except Exception as e:  # no cache: DuckDB runs for real
+            log("tpcds cache unavailable:", repr(e)[:100])
+        cls = module.TestExecutor
+        orig_ce = cls.cached_execute
+
+        def cached_execute(self, sql, tpch=True):
+            if tpch:
+                return orig_ce(self, sql, tpch)
+            if sql not in self.cache:
+                duck_sql = module.transpile(sql, write="duckdb")[0]
+                hit = cache.get(duck_sql)
+                self.cache[sql] = hit.copy() if hit is not None else self.tpcds_conn.execute(duck_sql).fetchdf()
+            return self.cache[sql]
+        cls.cached_execute = cached_execute
+
+        # Early stop: the test passes only if every query matches, so stop at the first mismatch.
+        # parse/execute errors already end the original test; only subtest assertions continue.
+        orig_mp = cls._mp_execute
+
+        def _mp_execute(self, schema, tables, sqls, tpch):
+            if tpch:
+                return orig_mp(self, schema, tables, sqls, tpch)
+            with module.ProcessPoolExecutor(mp_context=module.get_context("spawn"),
+                                            initializer=module.initializer,
+                                            initargs=(schema, tables)) as pool:
+                for i, (args, sql, _) in enumerate(sqls):
+                    table = pool.submit(module.mp_execute, module.parse_one(sql), args).result()
+                    if table is not None:
+                        _, sql_i, _ = self.tpcds_sqls[i]
+                        a = self.cached_execute(sql_i, tpch=False)
+                        b = module.pd.DataFrame(
+                            ((module.np.nan if c is None else c for c in r) for r in table.rows),
+                            columns=table.columns,
+                        )
+                        module.assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+        cls._mp_execute = _mp_execute
+
+    def _patch_fixture_cases(self, module, units, current):
+        """Fixture-case filter for optimizer check_file tests, active only while that test runs."""
+        keep = {}
+        for n, us in (units or {}).items():
+            per = {}
+            for u in us:
+                if u.startswith("c:"):
+                    fname, i = u[2:].rsplit(":", 1)
+                    per.setdefault(fname, set()).add(int(i))
+            if per:
+                keep[n] = per
+        if not keep:
             return
         orig = module.load_sql_fixture_pairs
 
         def load_sql_fixture_pairs(filename):
-            items = list(orig(filename))
-            if "tpc-ds" in filename:
-                return [x for i, x in enumerate(items) if i in keep]
-            return items
+            k = keep.get(current.get("num"), {}).get(filename)
+            for i, item in enumerate(orig(filename), start=1):
+                if k is None or i in k:
+                    yield item
         module.load_sql_fixture_pairs = load_sql_fixture_pairs
 
     @staticmethod
@@ -1613,6 +1926,7 @@ class Runner:
                 by_mod.setdefault(t["file"][:-3].replace("/", "."), []).append((n, parts[1], parts[2]))
             failed = set()
             id_to_num = {}
+            current = {}
             suite = unittest.TestSuite()
             for modname, items in by_mod.items():
                 try:
@@ -1620,8 +1934,11 @@ class Runner:
                 except BaseException:
                     failed |= {n for n, _, _ in items}
                     continue
-                if self.units and modname == "tests.test_executor":
-                    self._filter_tpcds(module, self.units)
+                if modname == "tests.test_optimizer":
+                    self._patch_fixture_cases(module, self.units, current)
+                if modname == "tests.test_executor" and any(
+                        self.by_number[n]["id"].endswith("::test_execute_tpcds") for n, _, _ in items):
+                    self._patch_tpcds(module, self.units)
                 for n, cls, meth in items:
                     try:
                         case = getattr(module, cls)(meth)
@@ -1664,6 +1981,7 @@ class Runner:
                         now = time.process_time()
                         meas["gap_" + test.id().rsplit(".", 1)[0]] = meas.get("gap_" + test.id().rsplit(".", 1)[0], 0) + now - meas["last"]
                         meas["last"] = now
+                    current["num"] = n
                     if n is not None:
                         ran.add(n)
                         if time.time() > deadline:
@@ -1752,8 +2070,12 @@ def read_all(pid):
 CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "1.15"))
 RUN_OVERHEAD_MS = float(os.environ.get("RUN_OVERHEAD_MS", "200"))
 NEVER_RUN_MS = float(os.environ.get("NEVER_RUN_MS", "15000"))
+P_ANY = float(os.environ.get("P_ANY", "0.75"))
 UNIT_SETUP_MS = float(os.environ.get("UNIT_SETUP_MS", "2000"))
 UNIT_MS = float(os.environ.get("UNIT_MS", "400"))
+
+
+UNIT_COSTS = {}
 
 
 def load_cpu(tests, ms):
@@ -1764,10 +2086,11 @@ def load_cpu(tests, ms):
     except Exception:
         c = {"test": {}, "class": {}}
     cpu_ms = {t["number"]: c["test"].get(t["id"], ms[t["number"]] * 1.5) for t in tests}
+    UNIT_COSTS.update(c.get("units", {}))
     return cpu_ms, c["class"]
 
 
-def choose(cands, ms, cpu_ms, class_ms, by_number, an):
+def choose(cands, ms, cpu_ms, class_ms, by_number, an, p_over=None):
     """Split candidates into (run, blind) minimising estimated CPU + selection cost."""
     if not cands:
         return set(), set()
@@ -1786,13 +2109,16 @@ def choose(cands, ms, cpu_ms, class_ms, by_number, an):
     orders = [sorted(pool, key=lambda n: -ms[n]),
               sorted(pool, key=lambda n: -(cpu_ms[n] - ms[n])),
               sorted(pool, key=lambda n: -cpu_ms[n])]
-    p_fail = min(0.6, 2.0 / max(1, len(cands)))
+    # ~55% of commits break something among their candidates (samples + synthetic patches);
+    # spread that over the candidates as an independent per-test probability.
+    p_fail = 1 - (1 - P_ANY) ** (1.0 / max(1, len(cands)))
 
     def expected_output(run, blind):
         base = pack_cost(blind, ms)
         if not run:
             return base
-        extra = sum(p_fail * ms[n] for n in run)
+        po = p_over or {}
+        extra = sum(po.get(n, p_fail) * (ms[n] + (2000 if n in po else 0)) for n in run)
         p_any = 1 - (1 - p_fail) ** len(run)
         if not blind:
             extra += 2000 * p_any
@@ -1849,6 +2175,7 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
     cands |= set(mp.unknown_tests) if (an.cands or an.everything) else set()
     unit_filter = {}
     local_cpu = cpu_ms
+    p_over = {}
     for un in mp.unit_test_nums & cands:
         if un in an.units_all or an.everything:
             continue
@@ -1858,11 +2185,21 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
         if not us:
             cands.discard(un)
             continue
-        unit_filter[un] = sorted(int(u[1:]) for u in us if u.startswith("q"))
+        unit_filter[un] = sorted(us)
         if local_cpu is cpu_ms:
             local_cpu = dict(cpu_ms)
-        local_cpu[un] = UNIT_SETUP_MS + UNIT_MS * len(unit_filter[un])
-    run, blind = choose(cands, ms, local_cpu, class_ms, by_number, an)
+        uc = UNIT_COSTS.get(by_number[un]["id"])
+        total_units = max(1, mp.unit_count(un))
+        p_u = 0.15 + 0.5 * len(us) / total_units
+        if uc:
+            full = sum(uc["q"].get(u[1:], UNIT_MS) for u in us if u.startswith("q"))
+            setup = uc["setup"]
+        else:  # fixture cases: share of the test's measured CPU
+            full, setup = cpu_ms[un] * len(us) / total_units, 50
+        # early stop: a failing run usually ends within the first few queries
+        local_cpu[un] = setup + (1 - p_u) * full + p_u * min(full, 1500)
+        p_over[un] = p_u
+    run, blind = choose(cands, ms, local_cpu, class_ms, by_number, an, p_over)
     unit_filter = {k: v for k, v in unit_filter.items() if k in run}
     if an.import_check and not run and not an.everything:
         pick = min(cands, key=lambda n: cpu_ms[n]) if cands else min(all_numbers, key=lambda n: cpu_ms[n])
@@ -1894,7 +2231,9 @@ def main():
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     all_numbers = {t["number"] for t in tests}
+    log("start cpu %.2f" % _cpu())
     mp = Map(MAP_PATH, tests)
+    log("map loaded cpu %.2f" % _cpu())
     by_number = {t["number"]: t for t in tests}
     cpu_ms, class_ms = load_cpu(tests, ms)
     commits = sorted(os.listdir(os.path.join(DATA, "commits")))
@@ -1911,12 +2250,12 @@ def main():
 
         if DEBUG:
             log(cid, "cands", len(cands), "run", len(run), "blind", sorted(blind), an.reasons[:12])
-    log("analysis done in %.2fs" % (time.time() - T0))
+    log("analysis done in %.2fs cpu %.2f" % (time.time() - T0, _cpu()))
 
     runner = None
     if any(p["run"] for p in plans):
-        runner = Runner(tests)
-    log("warm done in %.2fs" % (time.time() - T0))
+        runner = Runner(tests, mp, plans)
+    log("warm done in %.2fs cpu %.2f" % (time.time() - T0, _cpu()))
     pending = [p for p in plans if p["run"]]
     active = {}
     deadline = T0 + WALL_BUDGET
