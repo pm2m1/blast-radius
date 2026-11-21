@@ -218,15 +218,23 @@ def mutate_add_func(rel, text):
     return text.rstrip("\n") + "\n\n\ndef _unused_helper_%d(x):\n    return x\n" % random.randrange(1000)
 
 
+LAST_MK = None
+
+
 def gen(kind):
-    if kind in ("code", "data", "comment", "addfunc", "cmp"):
+    if kind in ("code", "data", "comment", "addfunc", "cmp", "real"):
         rel = random.choice(SQL_PY)
     elif kind == "testcode":
         rel = random.choice(TEST_PY)
     else:
         rel = random.choice(FIXTURES)
     old = open(os.path.join(REPO, rel), encoding="utf-8").read()
-    if kind == "cmp":
+    global LAST_MK
+    LAST_MK = None
+    if kind == "real":
+        import realgen
+        new, LAST_MK = realgen.mutate(old)
+    elif kind == "cmp":
         new = mutate_cmp(rel, old)
     elif kind == "code" or kind == "testcode":
         new = mutate_code(rel, old, "func")
@@ -270,6 +278,9 @@ def ground_truth(runner, new_texts, an=None, mp=None):
             t = B.old_tree_of(rel)
             for ln in lines:
                 kind, q, nd = B.enclosing(t, ln)
+                if kind != "func":
+                    sup = set(MS)
+                    break
                 if kind == "func":
                     lo, hi = B.node_range(nd)
                     sup |= mp.cover(rel, lo, hi)
@@ -304,11 +315,12 @@ def main():
             continue
         miss = sorted(gt - sel)
         rec = {"kind": kind, "patch": patch, "gt": sorted(gt), "sel_n": len(sel), "cands_n": len(cands),
-               "miss": miss, "cost": B.pack_cost(sel, MS), "cpu": cpu, "reasons": an.reasons[:20],
+               "miss": miss, "cost": B.pack_cost(sel, MS), "oracle": B.pack_cost(gt, MS), "mk": LAST_MK, "cpu": cpu, "reasons": an.reasons[:20],
                "everything": an.everything, "gt_err": err, "secs": round(time.time() - t0, 1)}
         out.write(json.dumps(rec) + "\n")
         out.flush()
         done += 1
+        kind = LAST_MK or kind
         print("%3d %-8s gt=%-3d sel=%-4d cands=%-4d miss=%s cost=%.1f cpu=%.1f %s" % (
             done, kind, len(gt), len(sel), len(cands), miss[:5], rec["cost"] / 1000, cpu,
             patch.split("\n")[0][11:]), flush=True)

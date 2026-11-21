@@ -35,6 +35,8 @@ MEASURE = os.environ.get("MEASURE") == "1"
 CONSUMER_LEVEL = os.environ.get("CONSUMER_LEVEL", "1") == "1"
 ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "1") == "1"
 WM_LEVEL = os.environ.get("WM_LEVEL", "1") == "1"
+LAMBDA_LEVEL = os.environ.get("LAMBDA_LEVEL", "1") == "1"
+ESC_BUDGET = float(os.environ.get("ESC_BUDGET", "0.4"))  # CPU seconds for one import-time escalation
 LINE_LEVEL = os.environ.get("LINE_LEVEL", "1") == "1"
 RUN_MAX_SECONDS = float(os.environ.get("RUN_MAX_SECONDS", "1.0"))  # run tests cheaper than this
 WALL_BUDGET = float(os.environ.get("WALL_BUDGET", "120"))
@@ -83,6 +85,10 @@ class Map:
         self.units = {number_of[k]: v for k, v in m.get("units", {}).items() if k in number_of}
         self.usets = m.get("usets", [])
         self.unit_test_nums = set(self.units)
+        self._S_cache = {}
+        self.import_lambdas = set(m["import_lambdas"]) if "import_lambdas" in m else None
+        self.tpcds_rt_raw = m.get("tpcds_rt")
+        self._tpcds_rt = None
         self.wm = m.get("wm")
         if self.wm:
             self.wm_remap = [number_of.get(i) for i in self.wm["ids"]]
@@ -111,20 +117,32 @@ class Map:
                 out |= us
         return out
 
+    def tpcds_rt(self):
+        """query index -> {rel: set(lines run outside optimize())} for the TPC-DS executor test."""
+        if self._tpcds_rt is None and self.tpcds_rt_raw:
+            self._tpcds_rt = {int(q): {f: set(ls) for f, ls in v.items()} for q, v in self.tpcds_rt_raw.items()}
+        return self._tpcds_rt
+
     def unit_count(self, num):
         return sum(1 for n in self.units[num]["names"] if n != "post")
 
     def S(self, sid):
-        return {self.remap[i] for i in self.sets[sid] if self.remap[i] is not None}
+        c = self._S_cache.get(sid)
+        if c is None:
+            c = frozenset(self.remap[i] for i in self.sets[sid] if self.remap[i] is not None)
+            self._S_cache[sid] = c
+        return c
 
     def cover(self, rel, lo, hi):
         lm = self.lines.get(rel)
         out = set()
         if not lm:
             return out
+        seen = set()
         for ln in range(lo, hi + 1):
             sid = lm.get(str(ln))
-            if sid is not None:
+            if sid is not None and sid not in seen:
+                seen.add(sid)
                 out |= self.S(sid)
         return out
 
@@ -134,11 +152,11 @@ class Map:
 
     def opens(self, rel):
         sid = self.m["opens"].get(rel)
-        return self.S(sid) if sid is not None else set()
+        return set(self.S(sid)) if sid is not None else set()
 
     def name_tests(self, name):
         sid = self.m["name_tests"].get(name)
-        return self.S(sid) if sid is not None else set()
+        return set(self.S(sid)) if sid is not None else set()
 
     def name_refs(self, name):
         return self.m["name_refs"].get(name, {})
@@ -433,6 +451,9 @@ class Analysis:
         self.units_all = set()  # unit tests (e.g. tpcds) reached by a non-line rule: all units affected
         self.line_sets = []  # (rel, lines) used for line-level selection
         self.import_check = False  # names may have vanished: import every module in the child
+        self.non_body = False  # something other than function/lambda bodies changed
+        self.body_lines = []   # (rel, old lines) of every function/lambda body edit
+        self.data_readers = set()  # tests that read a changed data file
 
     def add(self, tests, why):
         if tests:
@@ -698,6 +719,7 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         old_tree = (old_tree_of(rel) if old_text is not None and old_text == _old_text_of(rel) else None) \
             or (ast.parse(old_text) if old_text is not None else ast.parse(""))
     except SyntaxError:
+        an.non_body = True
         an.all("old syntax " + rel)
         return
     try:
@@ -706,12 +728,14 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         # the patched module cannot be imported: every test whose import chain includes it fails;
         # the child run will discover that for runnable tests, but be safe.
         an.reimport = True
+        an.non_body = True
         an.add(importers_of_module(an, rel), "syntax-error-importers")
         if rel.startswith("sqlglot/"):
             an.all("syntax error in sqlglot module " + rel)
         return
     tree_cache[rel] = old_tree
     if new_tree is None:  # deleted file
+        an.non_body = True
         an.reimport = True
         an.import_check = True
         an.add(importers_of_module(an, rel), "deleted-module")
@@ -742,6 +766,8 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         return False
     is_test = rel.startswith("tests/")
     mod = module_name(rel)
+    if rel in ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py"):
+        an.non_body = True
 
     def scope_change(scope, why):
         if scope == "":
@@ -760,6 +786,7 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
                 an.reimport = True
                 an.add(set(), "new unreferenced function " + k)
                 continue
+            an.non_body = True
             if o is not None:
                 lo, hi = node_range(o[0])
                 an.add(mp.cover(rel, lo, hi), "removed-func-cover")
@@ -777,6 +804,9 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
             continue  # identical apart from comments / docstring
         lo, hi = node_range(on)
         body_only = func_header(on) == func_header(nn)
+        if not body_only or any("cache" in dump(d).lower() or "memo" in dump(d).lower() for d in on.decorator_list):
+            an.non_body = True
+        n_body = len(an.body_lines)
         precise = False
         if body_only and WM_LEVEL and mp.wm:
             wm_res = weak_mutation_tests(mp, rel, on, nn)
@@ -784,6 +814,7 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
                 tests_wm, lines_wm = wm_res
                 an.add(tests_wm, "lines-wm " + k)
                 an.line_sets.append((rel, lines_wm))
+                an.body_lines.append((rel, set(lines_wm)))
                 an.swap.setdefault(mod, []).append(k)
                 continue
         if body_only and fp is not None and LINE_LEVEL:
@@ -795,10 +826,12 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
                 for ln in ll:
                     fine |= mp.cover(rel, ln, ln)
                 an.add(fine, "lines " + k)
+                an.body_lines.append((rel, set(ll)))
                 an.coarse |= mp.cover(rel, lo, hi)
                 precise = True
         if not precise:
             an.add(mp.cover(rel, lo, hi), "func " + k)
+            an.body_lines.append((rel, set(range(lo, hi + 1))))
         if func_header(on) != func_header(nn):
             an.reimport = True
             an.import_check = True
@@ -811,6 +844,7 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         body_lo = on.body[0].lineno if on.body else on.lineno
         if mp.import_time(rel, body_lo, hi):
             an.reimport = True
+            an.non_body = True
             import_time_escalation(an, rel, k, on, o[1], 0)
         if func_header(on) == func_header(nn):
             an.swap.setdefault(mod, []).append(k)
@@ -820,6 +854,7 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         if o is None or n is None:
             an.reimport = True
             an.import_check = True
+            an.non_body = True
             scope_change((o or n)[1], "class added/removed " + k)
             if o is not None:
                 class_change(an, rel, k, oc, "removed class")
@@ -828,6 +863,7 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
             continue
         if class_header(o[0]) != class_header(n[0]):
             an.reimport = True
+            an.non_body = True
             class_change(an, rel, k, oc, "class header")
             scope_change(o[1], "class header " + k)
     for scope in set(os_) | set(ns):
@@ -838,6 +874,11 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         a = [dump(s) for s in olds]
         b = [dump(s) for s in news]
         if a != b:
+            pairs = lambda_only_change(mp, rel, olds, news) if LAMBDA_LEVEL else None
+            if pairs:
+                lambda_change(an, rel, mod, pairs)
+                continue
+            an.non_body = True
             an.reimport = True
             if scope == "":
                 an.import_check = True
@@ -851,6 +892,77 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         # anything structural in a test module: run the whole file and its importers
         if an.reimport:
             an.add(mp.test_file_tests(rel), "test-module")
+
+
+def _outer_lambdas(stmts):
+    out = []
+
+    def rec(n):
+        if isinstance(n, ast.Lambda):
+            out.append(n)
+            for a in ast.iter_child_nodes(n.args):
+                rec(a)
+            return
+        for c in ast.iter_child_nodes(n):
+            rec(c)
+    for s in stmts:
+        rec(s)
+    return out
+
+
+def _mask_lambdas(stmts):
+    import copy
+    out = []
+    for s in stmts:
+        c = copy.deepcopy(s)
+        for lam in _outer_lambdas([c]):
+            lam.body = ast.Constant(value=None)
+        out.append(dump(c))
+    return out
+
+
+def lambda_only_change(mp, rel, olds, news):
+    """[(old Lambda, new Lambda)] when the statements differ only inside lambda bodies that are never
+    called while modules import; None otherwise."""
+    if mp.import_lambdas is None or len(olds) != len(news) or not olds:
+        return None
+    if _mask_lambdas(olds) != _mask_lambdas(news):
+        return None
+    ol, nl = _outer_lambdas(olds), _outer_lambdas(news)
+    if len(ol) != len(nl):
+        return None
+    pairs = [(a, b) for a, b in zip(ol, nl) if dump(a.body) != dump(b.body)]
+    if not pairs:
+        return None
+    lam_lines = {}
+    for a in ol:
+        lam_lines.setdefault(a.lineno, []).append(a)
+    for a, b in pairs:
+        if "%s:%d" % (rel, a.lineno) in mp.import_lambdas:
+            return None
+        # several lambdas sharing a first line cannot be told apart in the import profile
+        if len(lam_lines.get(a.lineno, ())) > 1 and any(
+                "%s:%d" % (rel, x.lineno) in mp.import_lambdas for x in lam_lines[a.lineno]):
+            return None
+    return pairs
+
+
+def lambda_change(an, rel, mod, pairs):
+    mp = an.mp
+    for a, b in pairs:
+        if WM_LEVEL and mp.wm:
+            wm_res = weak_mutation_tests(mp, rel, a, b)
+            if wm_res is not None:
+                tests_wm, lines_wm = wm_res
+                an.body_lines.append((rel, set(lines_wm)))
+                an.add(tests_wm, "lambda-wm %d" % a.lineno)
+                an.line_sets.append((rel, lines_wm))
+                continue
+        lo, hi = a.lineno, a.end_lineno
+        an.body_lines.append((rel, set(range(lo, hi + 1))))
+        an.add(mp.cover(rel, lo, hi), "lines lambda %d" % a.lineno)
+        an.line_sets.append((rel, set(range(lo, hi + 1))))
+    an.reimport = True
 
 
 def os_names(os_):
@@ -1205,6 +1317,7 @@ def read_at_import_in_code(mp, attr, cls_key=None, derived=None):
 
 
 def class_change(an, rel, qual, oc, why, stmts=None, old_stmts=()):
+    an.non_body = True
     mp = an.mp
     an.reimport = True
     key = class_key(rel, qual)
@@ -1380,6 +1493,7 @@ def imports_name_from(tree, modname, name):
 
 
 def module_change(an, rel, old_tree, of, oc, os_, ns, why, stmts=None):
+    an.non_body = True
     mp = an.mp
     an.reimport = True
     names = module_simple_names(stmts) if (stmts and ATTR_LEVEL and old_tree is not None) else None
@@ -1537,6 +1651,13 @@ def import_time_escalation(an, rel, qual, node, scope, depth):
     if depth > 4:
         an.all("import-time escalation too deep " + qual)
         return
+    if depth == 0:
+        an.esc_start = time.process_time()
+    elif time.process_time() - getattr(an, "esc_start", time.process_time()) > ESC_BUDGET:
+        an.all("import-time escalation budget " + qual)
+        return
+    if an.everything:
+        return
     name = qual.split(".")[-1].split("#")[0]
     if scope:  # a method: treat as a change to its class (covers metaclass methods via users)
         tree = old_tree_of(rel)
@@ -1597,6 +1718,7 @@ def analyze_commit(mp, patch_text):
         rel = fp.path
         old_rel = fp.old
         if fp.binary:
+            an.non_body = True
             an.add(mp.opens(rel), "binary-opens")
             if rel.startswith(("sqlglot/", "tests/")) and not mp.opens(rel):
                 an.all("binary file in source tree " + rel)
@@ -1618,6 +1740,7 @@ def analyze_commit(mp, patch_text):
             an.all("patch does not apply " + rel)
             continue
         if fp.old and fp.new and fp.old != fp.new:  # rename
+            an.non_body = True
             new_texts[fp.old] = None
             an.add(mp.opens(fp.old), "renamed-from-opens")
             if fp.old.endswith(".py"):
@@ -1631,6 +1754,7 @@ def analyze_commit(mp, patch_text):
         if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
             if fp.new_file and old_text is None:
                 # a new module: only matters if something imports it
+                an.non_body = True
                 an.reimport = True
                 an.add(mp.name_tests(os.path.basename(rel)[:-3]), "new-module-name")
                 if rel.startswith("tests/") and os.path.basename(rel).startswith("test_"):
@@ -1643,6 +1767,9 @@ def analyze_commit(mp, patch_text):
             continue
         # data files
         readers = mp.opens(rel)
+        an.data_readers |= readers
+        if rel.endswith(".py"):
+            an.non_body = True
         if readers:
             an.add(readers, "readers")
             an.reimport = an.reimport or rel.endswith(".py")
@@ -1888,9 +2015,34 @@ class Runner:
         """test_execute_tpcds in the child: optional query filter, early stop, and DuckDB results
         reused when the patched sqlglot emits exactly the pinned DuckDB SQL."""
         keep = None
+        fq = []
+        budget = None
+        uc = {"q": {}, "setup": 1000}
         for n, us in (units or {}).items():
             if self.by_number[n]["id"].endswith("::test_execute_tpcds"):
                 keep = {int(u[1:]) for u in us if u.startswith("q")}
+                fq = [int(u[1:]) for u in us if u.startswith("f")]
+                budget = next((float(u[1:]) for u in us if u.startswith("b")), None)
+                uc = UNIT_COSTS.get(self.by_number[n]["id"]) or uc
+        cache = {}
+        try:
+            import pickle
+            with real_io_open(TPCDS_CACHE, "rb") as f:
+                cache = pickle.load(f)
+        except Exception as e:  # no cache: DuckDB runs for real
+            log("tpcds cache unavailable:", repr(e)[:100])
+        if fq:
+            qcost = lambda q: uc["q"].get(str(q), UNIT_MS)  # noqa
+            fq.sort(key=lambda q: -qcost(q))
+            base = uc["setup"] + sum(qcost(q) for q in keep)
+            bad = self._tpcds_fp_check(module, fq, cache, base, qcost, budget)
+            if bad is None:
+                log("tpcds fingerprint check: over budget, including the test")
+                return "include"
+            log("tpcds fingerprint check:", len(fq), "queries,", len(bad), "differ")
+            keep |= bad
+            if not keep:
+                return "skip"  # every affected query provably unchanged: the test passes
         if keep is not None:
             orig = module.load_sql_fixture_pairs
 
@@ -1901,13 +2053,6 @@ class Runner:
                 return items
             module.load_sql_fixture_pairs = load_sql_fixture_pairs
 
-        cache = {}
-        try:
-            import pickle
-            with real_io_open(TPCDS_CACHE, "rb") as f:
-                cache = pickle.load(f)
-        except Exception as e:  # no cache: DuckDB runs for real
-            log("tpcds cache unavailable:", repr(e)[:100])
         cls = module.TestExecutor
         orig_ce = cls.cached_execute
 
@@ -1942,6 +2087,60 @@ class Runner:
                         )
                         module.assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
         cls._mp_execute = _mp_execute
+        return "run"
+
+    def _tpcds_fp_check(self, module, idxs, cache, base=0.0, qcost=None, budget=None):
+        """Queries whose patched parse / DuckDB SQL / optimized tree differ from the pinned commit
+        (or that error or time out). The others reach the executor's runtime phase with identical
+        input, and the caller already knows no changed line runs in that phase for them."""
+        import pickle
+        fps = cache.get("__fp__")
+        if not fps:
+            return set(idxs)
+        try:
+            sys.path.insert(0, _HERE)
+            import tpcds_fp
+        except Exception:
+            return set(idxs)
+        bad = set()
+
+        class FpTimeout(Exception):
+            pass
+
+        def on_alarm(signum, frame):
+            raise FpTimeout()
+        old = signal.signal(signal.SIGALRM, on_alarm)
+        signal.setitimer(signal.ITIMER_REAL, 30)
+        try:
+            items = list(module.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+            need = base
+            for i in idxs:
+                if budget is not None and bad and need > budget:
+                    return None
+                try:
+                    args, sql, _ = items[i]
+                    e = pickle.loads(pickle.dumps(module.parse_one(sql)))
+                    if args.get("execute"):
+                        if module.transpile(sql, write="duckdb")[0] not in cache:
+                            bad.add(i)
+                            need += qcost(i) if qcost else 0
+                            continue
+                        if tpcds_fp.fingerprint(e, module.TPCDS_SCHEMA) != fps.get(i):
+                            bad.add(i)
+                            need += qcost(i) if qcost else 0
+                except FpTimeout:
+                    raise
+                except BaseException:  # noqa
+                    bad.add(i)
+                    need += qcost(i) if qcost else 0
+            if budget is not None and bad and need > budget:
+                return None
+        except BaseException:  # noqa
+            bad = set(idxs)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+        return bad
 
     def _patch_fixture_cases(self, module, units, current):
         """Fixture-case filter for optimizer check_file tests, active only while that test runs."""
@@ -2040,7 +2239,12 @@ class Runner:
                     self._patch_fixture_cases(module, self.units, current)
                 if modname == "tests.test_executor" and any(
                         self.by_number[n]["id"].endswith("::test_execute_tpcds") for n, _, _ in items):
-                    self._patch_tpcds(module, self.units)
+                    verdict = self._patch_tpcds(module, self.units)
+                    if verdict in ("skip", "include"):
+                        tp = {x[0] for x in items if self.by_number[x[0]]["id"].endswith("::test_execute_tpcds")}
+                        items = [x for x in items if x[0] not in tp]
+                        if verdict == "include":
+                            failed |= tp
                 for n, cls, meth in items:
                     try:
                         case = getattr(module, cls)(meth)
@@ -2177,6 +2381,11 @@ NEVER_RUN_MS = float(os.environ.get("NEVER_RUN_MS", "15000"))
 P_ANY = float(os.environ.get("P_ANY", "0.75"))
 UNIT_SETUP_MS = float(os.environ.get("UNIT_SETUP_MS", "2000"))
 UNIT_MS = float(os.environ.get("UNIT_MS", "400"))
+TPCDS_FP_LEVEL = os.environ.get("TPCDS_FP_LEVEL", "1") == "1"
+FP_BASE_MS = float(os.environ.get("FP_BASE_MS", "250"))
+FP_QUERY_MS = float(os.environ.get("FP_QUERY_MS", "37"))
+FP_EXEC_PASS = float(os.environ.get("FP_EXEC_PASS", "0.25"))
+FP_P_EQUAL = float(os.environ.get("FP_P_EQUAL", "0.5"))
 
 
 UNIT_COSTS = {}
@@ -2212,6 +2421,7 @@ def choose(cands, ms, cpu_ms, class_ms, by_number, an, p_over=None):
     best = None
     orders = [sorted(pool, key=lambda n: -ms[n]),
               sorted(pool, key=lambda n: -(cpu_ms[n] - ms[n])),
+              sorted(pool, key=lambda n: -(cpu_ms[n] * CPU_FACTOR - ms[n])),
               sorted(pool, key=lambda n: -cpu_ms[n])]
     # ~55% of commits break something among their candidates (samples + synthetic patches);
     # spread that over the candidates as an independent per-test probability.
@@ -2229,10 +2439,15 @@ def choose(cands, ms, cpu_ms, class_ms, by_number, an, p_over=None):
         return base + extra
 
     for order in orders:
-        for k in list(range(0, min(len(order), 25) + 1)) + [len(order)]:
-            blind = set(order[:k]) | never_run
+        L = len(order)
+        ks = sorted(set(range(0, min(L, 40) + 1)) | set(range(max(0, L - 40), L + 1)))
+        for k in reversed(ks):  # small runs first: they set a low bound that prunes the big ones
             run = set(order[k:])
-            cost = est(run) + expected_output(run, blind)
+            e = est(run)
+            if best is not None and e >= best[0]:
+                continue
+            blind = set(order[:k]) | never_run
+            cost = e + expected_output(run, blind)
             if best is None or cost < best[0]:
                 best = (cost, run, blind)
     return best[1], best[2]
@@ -2306,6 +2521,54 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
     local_cpu = cpu_ms
     p_over = {}
     for un in mp.unit_test_nums & cands:
+        tid = by_number[un]["id"]
+        if (TPCDS_FP_LEVEL and tid.endswith("::test_execute_tpcds") and not an.everything and not an.non_body
+                and an.body_lines and un not in an.data_readers and mp.tpcds_rt() and os.path.exists(TPCDS_CACHE)):
+            us_fp = mp.affected_units(un, an.body_lines)
+            if us_fp is not None:
+                if not us_fp:
+                    cands.discard(un)
+                    continue
+                rt = mp.tpcds_rt()
+                changed = [(rel, l) for rel, ls in an.body_lines for l in ls]
+                E, F = [], []
+                for u in us_fp:
+                    if not u.startswith("q"):
+                        E = None
+                        break
+                    q = int(u[1:])
+                    r = rt.get(q)
+                    (E if r is not None and any(l in r.get(rel, ()) for rel, l in changed) else F).append(q)
+                if E is not None:
+                    if local_cpu is cpu_ms:
+                        local_cpu = dict(cpu_ms)
+                    budget = FP_EXEC_PASS * ms[un] / CPU_FACTOR
+                    unit_filter[un] = ["q%d" % q for q in sorted(E)] + ["f%d" % q for q in sorted(F)] + \
+                        ["b%d" % budget]
+                    uc = UNIT_COSTS.get(tid) or {"q": {}, "setup": 1000}
+                    total_units = max(1, mp.unit_count(un))
+                    full = sum(uc["q"].get(str(q), UNIT_MS) for q in E)
+                    if E and uc["setup"] + full > budget:
+                        unit_filter.pop(un)
+                        if local_cpu is not cpu_ms:
+                            local_cpu[un] = cpu_ms[un]
+                        local_cpu = dict(local_cpu)
+                        local_cpu[un] = 10 ** 9  # never worth running: include it
+                        continue
+                    p_u = (0.15 + 0.5 * len(E) / total_units) if E else 0.0
+                    p_u = 1 - (1 - p_u) * (FP_P_EQUAL if F else 1.0)
+                    c = FP_BASE_MS + FP_QUERY_MS * len(F) * (FP_P_EQUAL + (1 - FP_P_EQUAL) * 0.3)
+                    cls_key = tid.rsplit("::", 1)[0]
+                    if not E and not any(n != un and by_number[n]["id"].rsplit("::", 1)[0] == cls_key for n in cands):
+                        # the class setup (CSV loading) only runs if a fingerprint differs
+                        class_ms = dict(class_ms)
+                        class_ms[cls_key] = class_ms.get(cls_key, 0) * (1 - FP_P_EQUAL) * 0.3
+                    if E:
+                        c += uc["setup"] + (1 - p_u) * full + p_u * min(full, 1500)
+                    local_cpu[un] = c
+                    p_over[un] = p_u
+                    an.reasons.append("tpcds-fp E=%d F=%d" % (len(E), len(F)))
+                    continue
         if un in an.units_all or an.everything:
             continue
         us = mp.affected_units(un, an.line_sets)

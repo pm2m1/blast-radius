@@ -18,6 +18,20 @@ for i, (args, sql, _) in enumerate(cls.tpcds_sqls):
         cache[duck_sql] = cls.tpcds_conn.execute(duck_sql).fetchdf()
     except Exception as e:  # not compared at the pinned commit; runtime falls back to DuckDB
         print("skip query", i + 1, type(e).__name__, file=sys.stderr)
+# Fingerprints of the optimized tree per executed query (the exact call the executor makes).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pickle as _p
+import tpcds_fp
+from sqlglot import parse_one
+from tests.helpers import TPCDS_SCHEMA
+fps = {}
+for i, (args, sql, _) in enumerate(cls.tpcds_sqls):
+    if args.get("execute"):
+        try:
+            fps[i] = tpcds_fp.fingerprint(_p.loads(_p.dumps(parse_one(sql))), TPCDS_SCHEMA)
+        except Exception as e:
+            print("no fingerprint", i, type(e).__name__, file=sys.stderr)
+cache["__fp__"] = fps
 with open(out, "wb") as f:
     pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
 print("tpcds cache:", len(cache), "queries", os.path.getsize(out), "bytes", file=sys.stderr)
