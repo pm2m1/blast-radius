@@ -28,10 +28,13 @@ import time
 
 REPO = os.environ.get("SQLGLOT_DIR", "/app/sqlglot")
 DATA = os.environ.get("DATA_DIR", "/data")
-MAP_PATH = os.environ.get("MAP_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "map.json.gz"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+MAP_PATH = os.environ.get("MAP_PATH") or (os.path.join(_HERE, "map.marshal") if os.path.exists(os.path.join(_HERE, "map.marshal"))
+                                          else os.path.join(_HERE, "map.json.gz"))
 MEASURE = os.environ.get("MEASURE") == "1"
 CONSUMER_LEVEL = os.environ.get("CONSUMER_LEVEL", "1") == "1"
 ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "1") == "1"
+WM_LEVEL = os.environ.get("WM_LEVEL", "1") == "1"
 LINE_LEVEL = os.environ.get("LINE_LEVEL", "1") == "1"
 RUN_MAX_SECONDS = float(os.environ.get("RUN_MAX_SECONDS", "1.0"))  # run tests cheaper than this
 WALL_BUDGET = float(os.environ.get("WALL_BUDGET", "120"))
@@ -59,7 +62,7 @@ class Map:
     def __init__(self, path, tests):
         if path.endswith(".marshal"):
             with open(path, "rb") as f:
-                m = marshal.load(f)
+                m = marshal.loads(f.read())
         else:
             m = json.load(gzip.open(path))
         self.m = m
@@ -72,12 +75,21 @@ class Map:
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
-        self.unknown_tests = [t["number"] for t in tests if t["id"] not in set(m["ids"])]
+        known = set(m["ids"])
+        self.unknown_tests = [t["number"] for t in tests if t["id"] not in known]
+        self.number_to_index = {self.remap[i]: i for i in range(len(self.remap)) if self.remap[i] is not None}
         self._mro_rev = None
         number_of = {t["id"]: t["number"] for t in tests}
         self.units = {number_of[k]: v for k, v in m.get("units", {}).items() if k in number_of}
         self.usets = m.get("usets", [])
         self.unit_test_nums = set(self.units)
+        self.wm = m.get("wm")
+        if self.wm:
+            self.wm_remap = [number_of.get(i) for i in self.wm["ids"]]
+            self.wm_custom = set(self.wm.get("custom", []))
+
+    def wm_tests(self, sid):
+        return {self.wm_remap[i] for i in self.wm["sets"][sid] if self.wm_remap[i] is not None}
 
     def affected_units(self, num, line_sets):
         """Unit names (TPC-DS queries q<k>, fixture cases c:<file>:<i>) reached by the changed lines;
@@ -445,6 +457,67 @@ def class_key(rel, qual):
 
 
 
+_OPS = ["Lt", "LtE", "Gt", "GtE", "Eq", "NotEq", "Is", "IsNot", "In", "NotIn"]
+_IS_EQ = {"Is", "IsNot", "Eq", "NotEq"}
+PERF_SENSITIVE = ("::test_max_nodes", "::test_generator_memory")
+
+
+def op_swaps(on, nn):
+    """[(old Compare node, old op, new op)] if the two functions differ only in comparison operators."""
+    import copy
+
+    def norm(node):
+        c = copy.deepcopy(node)
+        for x in ast.walk(c):
+            if isinstance(x, ast.Compare):
+                x.ops = [ast.Eq() for _ in x.ops]
+        return dump(c)
+    if norm(on) != norm(nn):
+        return None
+    out = []
+    for a, b in zip(ast.walk(on), ast.walk(nn)):
+        if isinstance(a, ast.Compare) and [type(o) for o in a.ops] != [type(o) for o in b.ops]:
+            if len(a.ops) != 1 or len(b.ops) != 1:
+                return None
+            out.append((a, type(a.ops[0]).__name__, type(b.ops[0]).__name__))
+    return out or None
+
+
+def weak_mutation_tests(mp, rel, on, nn):
+    """Tests whose recorded run would observe a difference from the operator swaps, or None if
+    the weak-mutation profile cannot decide (fall back to coverage)."""
+    swaps = op_swaps(on, nn)
+    if not swaps:
+        return None
+    wm = mp.wm
+    out, lines = set(), set()
+    for node, old, new in swaps:
+        key = "%s:%d:%d" % (rel, node.lineno, node.col_offset)
+        if new not in _OPS:
+            return None
+        imask = wm["import"].get(key, 0)
+        if imask & (1 << _OPS.index(new)) or imask & (1 << 15):
+            return None  # differs while importing: state built at import changes
+        if (old in _IS_EQ and new in _IS_EQ and ({old, new} & {"Is", "IsNot"}) and
+                ({old, new} & {"Eq", "NotEq"}) and key in mp.wm_custom):
+            return None  # identity <-> equality with a custom __eq__ (side effects such as hash caching)
+        reached_sid = wm["reached"].get(key)
+        covered = mp.cover(rel, node.lineno, node.end_lineno)
+        if reached_sid is None:
+            if covered:
+                return None  # profile and coverage disagree: do not trust it
+            continue
+        reached = mp.wm_tests(reached_sid)
+        sid = wm["flip"].get(key, {}).get(new)
+        if sid is not None:
+            out |= mp.wm_tests(sid)
+        # tests that measure time or memory can notice an equivalent but costlier operator
+        out |= {n for n in reached if any(mp.m["ids"][i].endswith(PERF_SENSITIVE)
+                                          for i in [mp.number_to_index.get(n, -1)] if i >= 0)}
+        lines.update(range(node.lineno, node.end_lineno + 1))
+    return out, lines
+
+
 def code_shapes(text, filename):
     """co_qualname -> shape tuple for every code object in a module."""
     import types
@@ -452,6 +525,33 @@ def code_shapes(text, filename):
         code = compile(text, filename, "exec", dont_inherit=True)
     except SyntaxError:
         return None
+    out = {}
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        out.setdefault(c.co_qualname, []).append((c.co_varnames, c.co_cellvars, c.co_freevars, c.co_flags,
+                                                 c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount))
+        for k in c.co_consts:
+            if isinstance(k, types.CodeType):
+                stack.append(k)
+    return out
+
+
+def func_shapes(node):
+    """Code-object shapes of one function compiled on its own (old and new compiled alike)."""
+    import copy
+    n = copy.copy(node)
+    n.decorator_list = []
+    mod = ast.Module(body=[n], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    try:
+        return code_shapes_from(compile(mod, "<f>", "exec", dont_inherit=True))
+    except Exception:
+        return None
+
+
+def code_shapes_from(code):
+    import types
     out = {}
     stack = [code]
     while stack:
@@ -619,10 +719,7 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         if rel.startswith("sqlglot/"):
             an.all("deleted sqlglot module")
         return
-    if dump(old_tree) == dump(new_tree):
-        an.add(mp.opens(rel), "opens-only")  # tests reading the source text
-        return
-    an.add(mp.opens(rel), "opens")
+    an.add(mp.opens(rel), "opens")  # tests that read the source text itself
     of, oc, os_ = _units_cached(rel, old_tree)
     nf, nc, ns = scope_units(new_tree)
     shapes = [None, None]
@@ -681,12 +778,17 @@ def analyze_py(an, rel, old_text, new_text, tree_cache, fp=None):
         lo, hi = node_range(on)
         body_only = func_header(on) == func_header(nn)
         precise = False
+        if body_only and WM_LEVEL and mp.wm:
+            wm_res = weak_mutation_tests(mp, rel, on, nn)
+            if wm_res is not None:
+                tests_wm, lines_wm = wm_res
+                an.add(tests_wm, "lines-wm " + k)
+                an.line_sets.append((rel, lines_wm))
+                an.swap.setdefault(mod, []).append(k)
+                continue
         if body_only and fp is not None and LINE_LEVEL:
-            if shapes[0] is None:
-                shapes[0] = code_shapes(old_text, rel)
-                shapes[1] = code_shapes(new_text, rel)
-            qual = k  # co_qualname of methods is Class.method, same as our key
-            if "#" not in k and same_shape(shapes[0], shapes[1], qual):
+            qual = k
+            if "#" not in k and same_shape(func_shapes(on), func_shapes(nn), on.name):
                 ll = line_level_lines(fp.hunks, on)
                 an.line_sets.append((rel, ll))
                 fine = set()
@@ -2067,8 +2169,10 @@ def read_all(pid):
 
 
 # --------------------------------------------------------------------------- packing
-CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "1.15"))
-RUN_OVERHEAD_MS = float(os.environ.get("RUN_OVERHEAD_MS", "200"))
+# Scoring machines charge ~2.8x the CPU of the machine cpu.json was measured on
+# (two practice submissions: server CPU / local CPU on the same work).
+CPU_FACTOR = float(os.environ.get("CPU_FACTOR", "2.8"))
+RUN_OVERHEAD_MS = float(os.environ.get("RUN_OVERHEAD_MS", "60"))
 NEVER_RUN_MS = float(os.environ.get("NEVER_RUN_MS", "15000"))
 P_ANY = float(os.environ.get("P_ANY", "0.75"))
 UNIT_SETUP_MS = float(os.environ.get("UNIT_SETUP_MS", "2000"))
@@ -2141,12 +2245,37 @@ def pack_cost(numbers, ms):
     return max(sum(ms[n] for n in b) for b in bins) + 2000 * len(bins)
 
 
+def _best_two_way(items, ms):
+    """Exact split into two workers minimising the larger load (subset-sum bitset)."""
+    total = sum(ms[n] for n in items)
+    reach = 1
+    hist = []
+    for n in items:
+        hist.append(reach)
+        reach |= reach << ms[n]
+    target = total // 2
+    mask = reach & ((1 << (target + 1)) - 1)
+    s = mask.bit_length() - 1
+    a = []
+    for k in range(len(items) - 1, -1, -1):
+        w = ms[items[k]]
+        if s >= w and (hist[k] >> (s - w)) & 1:
+            a.append(items[k])
+            s -= w
+    aset = set(a)
+    return [a, [n for n in items if n not in aset]]
+
+
 def pack(numbers, ms):
     """Choose the worker count and split minimising max load + 2 s per worker."""
     if not numbers:
         return []
     items = sorted(numbers, key=lambda n: -ms[n])
     best = None
+    if 2 <= len(items) <= 400 and sum(ms[n] for n in items) <= 200000:
+        bins = _best_two_way(items, ms)
+        cost = max(sum(ms[n] for n in b) for b in bins) + 4000
+        best = (cost, bins)
     for k in range(1, 9):
         if k > len(items):
             break

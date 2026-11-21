@@ -18,7 +18,7 @@ import blast as B  # noqa
 REPO = B.REPO
 TESTS = json.load(open("/home/claude/kit/sample/tests.json"))["tests"]
 MS = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in TESTS}
-SKIP_GT = {t["number"] for t in TESTS if t["seconds"] > 15}  # tpcds executor, max_nodes: too slow for GT
+SKIP_GT = {t["number"] for t in TESTS if t["seconds"] > 15 and (os.environ.get("GT_TPCDS") != "1" or "tpcds" not in t["id"])}
 
 
 def files(prefix, ext=".py"):
@@ -137,6 +137,39 @@ def mutate_code(rel, text, scope="func"):
     return None
 
 
+CMP_SWAPS = [("==", "!="), ("!=", "=="), (" is not ", " != "), (" is not ", " is "), (" is ", " == "),
+             (" is ", " is not "), ("<=", "<"), ("<", "<="), (">=", ">"), (">", ">="), (" not in ", " in "),
+             (" in ", " not in ")]
+
+
+def mutate_cmp(rel, text):
+    """Swap one comparison operator inside a function body (the kind weak mutation decides)."""
+    tree = ast.parse(text)
+    lines = text.split("\n")
+    sites = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for c in ast.walk(n):
+                if isinstance(c, ast.Compare) and len(c.ops) == 1 and c.lineno == c.end_lineno:
+                    sites.append(c)
+    random.shuffle(sites)
+    for c in sites[:30]:
+        line = lines[c.lineno - 1]
+        seg = line[c.col_offset:c.end_col_offset]
+        opts = [(a, b) for a, b in CMP_SWAPS if a in seg]
+        if not opts:
+            continue
+        a, b = random.choice(opts)
+        seg2 = seg.replace(a, b, 1)
+        new_line = line[:c.col_offset] + seg2 + line[c.end_col_offset:]
+        cand = lines[:]
+        cand[c.lineno - 1] = new_line
+        t = "\n".join(cand)
+        if valid(t) and t != text:
+            return t
+    return None
+
+
 def mutate_comment(rel, text):
     lines = text.split("\n")
     for _ in range(30):
@@ -186,14 +219,16 @@ def mutate_add_func(rel, text):
 
 
 def gen(kind):
-    if kind in ("code", "data", "comment", "addfunc"):
+    if kind in ("code", "data", "comment", "addfunc", "cmp"):
         rel = random.choice(SQL_PY)
     elif kind == "testcode":
         rel = random.choice(TEST_PY)
     else:
         rel = random.choice(FIXTURES)
     old = open(os.path.join(REPO, rel), encoding="utf-8").read()
-    if kind == "code" or kind == "testcode":
+    if kind == "cmp":
+        new = mutate_cmp(rel, old)
+    elif kind == "code" or kind == "testcode":
         new = mutate_code(rel, old, "func")
     elif kind == "data":
         new = mutate_code(rel, old, "data")
@@ -226,9 +261,22 @@ def select_one(mp, runner, patch, cpu_ms, class_ms, by_number):
     return sel, p["an"], p["new"], p["cands"], cpu
 
 
-def ground_truth(runner, new_texts):
+def ground_truth(runner, new_texts, an=None, mp=None):
     nums = set(MS) - SKIP_GT
-    pid, _ = runner.start(nums, new_texts, {}, True, time.time() + 900)
+    if os.environ.get("GT_FAST") == "1" and an is not None:
+        # Sound for function-body edits: a test that never runs the edited function cannot change.
+        sup = set(an.coarse)
+        for rel, lines in an.line_sets:
+            t = B.old_tree_of(rel)
+            for ln in lines:
+                kind, q, nd = B.enclosing(t, ln)
+                if kind == "func":
+                    lo, hi = B.node_range(nd)
+                    sup |= mp.cover(rel, lo, hi)
+        if an.everything or not an.line_sets:
+            sup = set(MS)
+        nums = (sup | set(an.cands)) - SKIP_GT
+    pid, _ = runner.start(nums, new_texts, {}, True, time.time() + float(os.environ.get("GT_BUDGET", "900")))
     os.waitpid(pid, 0)
     res = json.loads(B.read_all(pid) or b'{"failed": null}')
     return set(res["failed"]) if res.get("failed") is not None else None, res.get("error")
@@ -251,7 +299,7 @@ def main():
             continue
         t0 = time.time()
         sel, an, new_texts, cands, cpu = select_one(mp, runner, patch, cpu_ms, class_ms, by_number)
-        gt, err = ground_truth(runner, new_texts)
+        gt, err = ground_truth(runner, new_texts, an, mp)
         if gt is None:
             continue
         miss = sorted(gt - sel)

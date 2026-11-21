@@ -16,6 +16,11 @@
 3. **Expensive** candidates are included without running when that is cheaper.
 4. Selections are packed into workers to minimise busiest worker + 2 s/worker.
 
+Weak-mutation profile: the map also records, per test, whether swapping each comparison
+operator (`<`/`<=`, `==`/`!=`, `is`/`==`, ...) would ever have changed that comparison's result during the
+test's run at the pinned commit (both seeds, original results always returned). When a patch only swaps
+operators, a test whose run never saw a difference is unaffected, step for step, and is not selected.
+
 Anything uncertain widens the selection. No answers are precomputed per patch.
 
 Rebuild the map: see `tools/build_map.py` (runs sqlglot's suite under coverage).

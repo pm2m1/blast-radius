@@ -8,7 +8,7 @@ mp = B.Map(B.MAP_PATH, T)
 cpu, cls = B.load_cpu(T, ms)
 A = json.load(open('/home/claude/kit/sample/answers.json'))['commits']
 cases = [(open('/home/claude/kit/sample/commits/%s.patch' % c).read(), set(v['failing'])) for c, v in A.items()]
-for f in ['mut_B.jsonl', 'mut_C.jsonl', 'mut_D.jsonl', 'mut_E.jsonl']:
+for f in ['mut_B.jsonl', 'mut_C.jsonl', 'mut_D.jsonl', 'mut_G.jsonl', 'mut_F.jsonl']:
     try:
         for l in open(f):
             r = json.loads(l); cases.append((r['patch'], set(r['gt'])))
