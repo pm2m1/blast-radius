@@ -2616,7 +2616,17 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
+def _calibration_work(n=64_000_000):
+    """Fixed amount of pure-Python work (about 4.0 CPU seconds on the dev machine). Used once to
+    measure how the scoring machines charge CPU relative to local measurements; removed after."""
+    x = 0
+    for i in range(n):
+        x = (x * 1103515245 + 12345) & 0x7fffffff
+    return x
+
+
 def main():
+    _calibration_work()
     out = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)  # anything else printed to stdout goes to stderr
     sys.stdout = sys.stderr
