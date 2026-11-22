@@ -2849,6 +2849,22 @@ def pack(numbers, ms):
 # --------------------------------------------------------------------------- main
 def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
     try:
+        return _plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers)
+    except Exception as e:  # never crash: select every test for this commit
+        log("plan crashed", cid, repr(e))
+        try:
+            an = Analysis(mp)
+            an.all("plan-crash")
+        except Exception:
+            import types
+            an = types.SimpleNamespace(swap={}, reimport=False, import_check=False, reasons=["plan-crash"],
+                                       everything=True, cands=set())
+        return {"id": cid, "an": an, "new": {}, "run": set(), "blind": set(all_numbers), "units": {},
+                "cands": set(all_numbers)}
+
+
+def _plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
+    try:
         an, new_texts = analyze_commit(mp, text)
     except Exception as e:  # never crash: fall back to everything
         log("analysis crashed", cid, repr(e))
@@ -3042,10 +3058,7 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
-def main():
-    out = os.fdopen(os.dup(1), "w")
-    os.dup2(2, 1)  # anything else printed to stdout goes to stderr
-    sys.stdout = sys.stderr
+def _main(out, state):
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     all_numbers = {t["number"] for t in tests}
@@ -3056,7 +3069,7 @@ def main():
     cpu_ms, class_ms = load_cpu(tests, ms)
     commits = sorted(os.listdir(os.path.join(DATA, "commits")))
     commits = [c for c in commits if c.endswith(".patch")]
-    plans = []
+    plans = state["plans"]
     for c in commits:
         cid = c[:-6]
         with open(os.path.join(DATA, "commits", c), encoding="utf-8", errors="surrogateescape") as f:
@@ -3116,6 +3129,7 @@ def main():
     for p in plans:
         sel = set(p.get("failed", set())) | p["blind"]
         out.write(json.dumps({"commit": p["id"], "workers": pack(sel, ms)}) + "\n")
+        state["written"].add(p["id"])
         if DEBUG:
             log(p["id"], p.get("mode"), "run", len(p["run"]), "est_ms", int(sum(cpu_ms[n] for n in p["run"])),
                 "cpu", p.get("cpu"), "selected", sorted(sel)[:20])
@@ -3124,6 +3138,39 @@ def main():
     rc = resource.getrusage(resource.RUSAGE_CHILDREN)
     log("done in %.2fs wall, cpu self %.2f children %.2f" % (time.time() - T0, ru.ru_utime + ru.ru_stime,
                                                              rc.ru_utime + rc.ru_stime))
+
+
+def main():
+    out = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)  # anything else printed to stdout goes to stderr
+    sys.stdout = sys.stderr
+    state = {"plans": [], "written": set()}
+    try:
+        _main(out, state)
+        return
+    except BaseException as e:  # never leave a commit unanswered
+        log("main crashed", repr(e))
+    try:
+        tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+        ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
+        everything = set(ms)
+        done = {p["id"]: p for p in state["plans"]}
+        for c in sorted(os.listdir(os.path.join(DATA, "commits"))):
+            if not c.endswith(".patch") or c[:-6] in state["written"]:
+                continue
+            p = done.get(c[:-6])
+            if p is not None and "failed" in p:
+                sel = set(p["failed"]) | set(p["blind"])
+            else:
+                sel = everything
+            try:
+                workers = pack(sel, ms)
+            except Exception:
+                workers = [sorted(sel)]
+            out.write(json.dumps({"commit": c[:-6], "workers": workers}) + "\n")
+        out.flush()
+    except BaseException as e:
+        log("fallback crashed", repr(e))
 
 
 if __name__ == "__main__":
