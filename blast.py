@@ -1074,6 +1074,21 @@ def _class_body_ok(old_cls, new_cls):
     return True
 
 
+_DIALECT_MODULES = None
+
+
+def _dialect_modules():
+    """Pinned-commit map: dialect name -> sqlglot modules that can run while its generator is built."""
+    global _DIALECT_MODULES
+    if _DIALECT_MODULES is None:
+        try:
+            with open(os.path.join(_HERE, "dialect_modules.json")) as f:
+                _DIALECT_MODULES = json.load(f)
+        except Exception:
+            _DIALECT_MODULES = {}
+    return _DIALECT_MODULES
+
+
 def duck_side_only(an, new_texts):
     """Every change is inside a dialect-specific module that the TPC-DS executor path never runs:
     the executor's results cannot change; only the DuckDB SQL the test compares against can."""
@@ -2541,6 +2556,13 @@ class Runner:
                     continue
                 if modname == "tests.test_optimizer":
                     self._patch_fixture_cases(module, self.units, current)
+                if modname == "tests.test_generator":
+                    for n, us in (self.units or {}).items():
+                        if self.by_number[n]["id"].endswith("::test_generator_memory"):
+                            names = {u[3:] for u in us if u.startswith("dl:")}
+                            if names:
+                                # only these dialects can construct generators differently
+                                module.Dialects = [d for d in module.Dialects if d.value in names]
                 if modname == "tests.test_executor" and any(
                         self.by_number[n]["id"].endswith("::test_execute_tpcds") for n, _, _ in items):
                     verdict = self._patch_tpcds(module, self.units)
@@ -2688,6 +2710,8 @@ UNIT_MS = float(os.environ.get("UNIT_MS", "400"))
 TPCDS_FP_LEVEL = os.environ.get("TPCDS_FP_LEVEL", "1") == "1"
 TPCDS_DUCK_LEVEL = os.environ.get("TPCDS_DUCK_LEVEL", "1") == "1"
 TPCDS_CG_LEVEL = os.environ.get("TPCDS_CG_LEVEL", "1") == "1"
+GENMEM_LEVEL = os.environ.get("GENMEM_LEVEL", "1") == "1"
+GENMEM_DIALECT_MS = float(os.environ.get("GENMEM_DIALECT_MS", "140"))
 DUCK_BASE_MS = float(os.environ.get("DUCK_BASE_MS", "300"))
 DUCK_QUERY_MS = float(os.environ.get("DUCK_QUERY_MS", "4"))
 FP_BASE_MS = float(os.environ.get("FP_BASE_MS", "250"))
@@ -2947,6 +2971,21 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
         # early stop: a failing run usually ends within the first few queries
         local_cpu[un] = setup + (1 - p_u) * full + p_u * min(full, 1500)
         p_over[un] = p_u
+    gm = next((n for n in cands if by_number[n]["id"].endswith("::test_generator_memory")), None)
+    if GENMEM_LEVEL and gm is not None and not an.everything:
+        if duck_only is None:
+            duck_only = duck_side_only(an, new_texts)
+        dmods = _dialect_modules() if duck_only else None
+        if dmods:
+            changed_files = {fp.path for fp in an.files}
+            affected = sorted(d for d, mods in dmods.items() if changed_files & set(mods))
+            if affected:
+                unit_filter[gm] = ["dl:" + d for d in affected]
+                if local_cpu is cpu_ms:
+                    local_cpu = dict(cpu_ms)
+                local_cpu[gm] = 100 + GENMEM_DIALECT_MS * len(affected)
+                p_over[gm] = 0.15
+                an.reasons.append("genmem-dialects %d" % len(affected))
     run, blind = choose(cands, ms, local_cpu, class_ms, by_number, an, p_over)
     if len(new_texts) == 1 and not an.everything:
         import tpcds_replay as replay
