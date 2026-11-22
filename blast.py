@@ -498,6 +498,7 @@ class Analysis:
         self.non_body = False  # something other than function/lambda bodies changed
         self.body_lines = []   # (rel, old lines) of every function/lambda body edit
         self.data_readers = set()  # tests that read a changed data file
+        self.files = []  # FilePatch objects of the commit
 
     def add(self, tests, why):
         if tests:
@@ -1024,6 +1025,72 @@ def lambda_change(an, rel, mod, pairs):
         an.add(mp.cover(rel, lo, hi), "lines lambda %d" % a.lineno)
         an.line_sets.append((rel, set(range(lo, hi + 1))))
     an.reimport = True
+
+
+_NON_EXECUTOR_DIRS = ("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/")
+_EXECUTOR_MODULES = ("__init__", "base", "dialect", "python")
+
+
+def _class_body_ok(old_cls, new_cls):
+    """Only assignments, functions and nested classes may differ inside a dialect class body."""
+    if ([dump(b) for b in old_cls.bases] != [dump(b) for b in new_cls.bases] or
+            [dump(k) for k in old_cls.keywords] != [dump(k) for k in new_cls.keywords] or
+            [dump(d) for d in old_cls.decorator_list] != [dump(d) for d in new_cls.decorator_list] or
+            old_cls.name != new_cls.name):
+        return False
+    if len(old_cls.body) != len(new_cls.body):
+        return False
+    for a, b in zip(old_cls.body, new_cls.body):
+        if dump(a) == dump(b):
+            continue
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.ClassDef):
+            if not _class_body_ok(a, b):
+                return False
+        elif isinstance(a, (ast.Assign, ast.AnnAssign)):
+            targets = a.targets if isinstance(a, ast.Assign) else [a.target]
+            if not all(isinstance(t, ast.Name) for t in targets):
+                return False
+            if [dump(t) for t in targets] != [dump(t) for t in (b.targets if isinstance(b, ast.Assign) else [b.target])]:
+                return False
+        elif not isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+    return True
+
+
+def duck_side_only(an, new_texts):
+    """Every change is inside a dialect-specific module that the TPC-DS executor path never runs:
+    the executor's results cannot change; only the DuckDB SQL the test compares against can."""
+    if not an.files:
+        return False
+    for fp in an.files:
+        rel = fp.path
+        if fp.binary or fp.new_file or fp.deleted or (fp.old and fp.old != rel):
+            return False
+        if not rel.startswith(_NON_EXECUTOR_DIRS) or not rel.endswith(".py"):
+            return False
+        if os.path.basename(rel)[:-3] in _EXECUTOR_MODULES:
+            return False
+        try:
+            with open(os.path.join(REPO, rel), encoding="utf-8") as f:
+                old_tree = ast.parse(f.read())
+            new_tree = ast.parse(new_texts.get(rel) or "")
+        except Exception:
+            return False
+        if len(old_tree.body) != len(new_tree.body):
+            return False
+        for a, b in zip(old_tree.body, new_tree.body):
+            if dump(a) == dump(b):
+                continue
+            if type(a) is not type(b):
+                return False
+            if isinstance(a, ast.ClassDef):
+                if not _class_body_ok(a, b):
+                    return False
+            elif not isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return False  # module-level statements could reach shared state
+    return True
 
 
 def os_names(os_):
@@ -1814,6 +1881,7 @@ def analyze_commit(mp, patch_text):
     if not files:
         an.all("unparseable patch")
         return an, new_texts
+    an.files = list(files)
     for fp in files:
         rel = fp.path
         old_rel = fp.old
@@ -1934,6 +2002,7 @@ class Runner:
         self.mp = mp
         self.plans = plans
         self.by_number = {t["number"]: t for t in tests}
+        self._duck_conn = None
         os.environ.setdefault("SKIP_INTEGRATION", "0")
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import syncpool
@@ -2131,12 +2200,14 @@ class Runner:
         reused when the patched sqlglot emits exactly the pinned DuckDB SQL."""
         keep = None
         fq = []
+        dq = []
         budget = None
         uc = {"q": {}, "setup": 1000}
         for n, us in (units or {}).items():
             if self.by_number[n]["id"].endswith("::test_execute_tpcds"):
                 keep = {int(u[1:]) for u in us if u.startswith("q")}
                 fq = [int(u[1:]) for u in us if u.startswith("f")]
+                dq = [int(u[1:]) for u in us if u.startswith("d")]
                 budget = next((float(u[1:]) for u in us if u.startswith("b")), None)
                 uc = UNIT_COSTS.get(self.by_number[n]["id"]) or uc
         cache = {}
@@ -2146,6 +2217,13 @@ class Runner:
                 cache = pickle.load(f)
         except Exception as e:  # no cache: DuckDB runs for real
             log("tpcds cache unavailable:", repr(e)[:100])
+        if dq:
+            bad = self._tpcds_duck_check(module, dq, cache)
+            log("tpcds duckdb-side check:", len(dq), "queries,", len(bad), "differ")
+            if not bad:
+                return "skip"
+            keep = (keep or set()) | bad
+            fq = []
         if fq:
             qcost = lambda q: uc["q"].get(str(q), UNIT_MS)  # noqa
             fq.sort(key=lambda q: -qcost(q))
@@ -2204,6 +2282,48 @@ class Runner:
         cls._mp_execute = _mp_execute
         return "run"
 
+    def _duck_same(self, module, i, new_sql, cache):
+        """True when DuckDB returns exactly the pinned result table for query i's new DuckDB SQL."""
+        old_sql = (cache.get("__duck__") or {}).get(i)
+        old = cache.get(old_sql) if old_sql else None
+        if old is None:
+            return False
+        if self._duck_conn is None:
+            import duckdb
+            conn = duckdb.connect()
+            for table, columns in module.TPCDS_SCHEMA.items():
+                conn.execute(f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{module.DIR_TPCDS}{table}.csv.gz', delim='|', header=True, columns={columns})
+                """)
+            self._duck_conn = conn
+        new = self._duck_conn.execute(new_sql).fetchdf()
+        return list(new.columns) == list(old.columns) and new.dtypes.tolist() == old.dtypes.tolist() \
+            and new.equals(old)
+
+    def _tpcds_duck_check(self, module, idxs, cache):
+        """The executor side is untouched (only non-executor dialect modules changed): a query passes
+        when its DuckDB SQL is unchanged, or DuckDB returns exactly the pinned table for the new SQL."""
+        bad = set()
+        try:
+            items = list(module.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+        except BaseException:  # noqa
+            return set(idxs)
+        for i in idxs:
+            try:
+                args, sql, _ = items[i]
+                if not args.get("execute"):
+                    continue
+                new_sql = module.transpile(sql, write="duckdb")[0]
+                if new_sql in cache and new_sql == (cache.get("__duck__") or {}).get(i):
+                    continue
+                if not self._duck_same(module, i, new_sql, cache):
+                    bad.add(i)
+            except BaseException:  # noqa
+                bad.add(i)
+        return bad
+
     def _tpcds_fp_check(self, module, idxs, cache, base=0.0, qcost=None, budget=None):
         """Queries whose patched parse / DuckDB SQL / optimized tree differ from the pinned commit
         (or that error or time out). The others reach the executor's runtime phase with identical
@@ -2236,7 +2356,8 @@ class Runner:
                     args, sql, _ = items[i]
                     e = pickle.loads(pickle.dumps(module.parse_one(sql)))
                     if args.get("execute"):
-                        if module.transpile(sql, write="duckdb")[0] not in cache:
+                        new_sql = module.transpile(sql, write="duckdb")[0]
+                        if new_sql not in cache and not self._duck_same(module, i, new_sql, cache):
                             bad.add(i)
                             need += qcost(i) if qcost else 0
                             continue
@@ -2497,6 +2618,9 @@ P_ANY = float(os.environ.get("P_ANY", "0.75"))
 UNIT_SETUP_MS = float(os.environ.get("UNIT_SETUP_MS", "2000"))
 UNIT_MS = float(os.environ.get("UNIT_MS", "400"))
 TPCDS_FP_LEVEL = os.environ.get("TPCDS_FP_LEVEL", "1") == "1"
+TPCDS_DUCK_LEVEL = os.environ.get("TPCDS_DUCK_LEVEL", "1") == "1"
+DUCK_BASE_MS = float(os.environ.get("DUCK_BASE_MS", "300"))
+DUCK_QUERY_MS = float(os.environ.get("DUCK_QUERY_MS", "4"))
 FP_BASE_MS = float(os.environ.get("FP_BASE_MS", "250"))
 FP_QUERY_MS = float(os.environ.get("FP_QUERY_MS", "37"))
 FP_EXEC_PASS = float(os.environ.get("FP_EXEC_PASS", "0.25"))
@@ -2643,8 +2767,26 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
     unit_filter = {}
     local_cpu = cpu_ms
     p_over = {}
+    duck_only = None
     for un in mp.unit_test_nums & cands:
         tid = by_number[un]["id"]
+        if TPCDS_DUCK_LEVEL and tid.endswith("::test_execute_tpcds") and not an.everything and mp.tpcds_rt() \
+                and os.path.exists(TPCDS_CACHE):
+            if duck_only is None:
+                duck_only = duck_side_only(an, new_texts)
+            if duck_only:
+                qs = sorted(mp.tpcds_rt())
+                unit_filter[un] = ["d%d" % q for q in qs]
+                if local_cpu is cpu_ms:
+                    local_cpu = dict(cpu_ms)
+                local_cpu[un] = DUCK_BASE_MS + DUCK_QUERY_MS * len(qs) + 0.25 * 3000
+                p_over[un] = 0.25
+                cls_key = tid.rsplit("::", 1)[0]
+                if not any(n != un and by_number[n]["id"].rsplit("::", 1)[0] == cls_key for n in cands):
+                    class_ms = dict(class_ms)
+                    class_ms[cls_key] = class_ms.get(cls_key, 0) * 0.25
+                an.reasons.append("tpcds-duckdb-side %d" % len(qs))
+                continue
         if (TPCDS_FP_LEVEL and tid.endswith("::test_execute_tpcds") and not an.everything and not an.non_body
                 and an.body_lines and un not in an.data_readers and mp.tpcds_rt() and os.path.exists(TPCDS_CACHE)):
             us_fp = mp.affected_units(un, an.body_lines)
