@@ -3003,7 +3003,7 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
-PROBE = "mid"
+PROBE = "small"
 
 
 def main():
