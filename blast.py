@@ -3003,6 +3003,9 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
+PROBE = "mid"
+
+
 def main():
     out = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)  # anything else printed to stdout goes to stderr
@@ -3076,6 +3079,12 @@ def main():
         p["failed"] = failed
     for p in plans:
         sel = set(p.get("failed", set())) | p["blind"]
+        # PROBE (diagnostic builds only): drop unverified tests in one size band
+        if PROBE:
+            lo, hi = {"mid": (1000, 20000), "small": (0, 1000)}[PROBE]
+            for n in list(sel):
+                if lo <= ms[n] < hi and n not in p.get("failed", set()):
+                    sel.discard(n)
         out.write(json.dumps({"commit": p["id"], "workers": pack(sel, ms)}) + "\n")
         if DEBUG:
             log(p["id"], p.get("mode"), "run", len(p["run"]), "est_ms", int(sum(cpu_ms[n] for n in p["run"])),
