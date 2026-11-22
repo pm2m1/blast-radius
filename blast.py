@@ -2739,7 +2739,7 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
-PROBE = "maxnodes"
+PROBE = "tpcds"
 
 
 def main():
