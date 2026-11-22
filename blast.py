@@ -2139,6 +2139,29 @@ class Runner:
                 fq = [int(u[1:]) for u in us if u.startswith("f")]
                 budget = next((float(u[1:]) for u in us if u.startswith("b")), None)
                 uc = UNIT_COSTS.get(self.by_number[n]["id"]) or uc
+        special = next((u for n, values in (units or {}).items()
+                        if self.by_number[n]["id"].endswith("::test_execute_tpcds")
+                        for u in values if u.startswith("replay:")), None)
+        if special:
+            import tpcds_replay as replay
+            try:
+                kind = special.split(":", 1)[1]
+                if kind != "fixture":
+                    import importlib
+                    name, *changed = kind.split("|")
+                    passed = replay.rule_passes(name, importlib.import_module("sqlglot.optimizer." + name), changed)
+                    if passed:
+                        return "skip"
+                    if not fq:
+                        return "include"
+                else:
+                    keep = replay.changed_queries(module)
+                    if keep is None:
+                        return "include"
+                    if not keep:
+                        return "skip"
+            except Exception:
+                return "include"
         cache = {}
         try:
             import pickle
@@ -2236,7 +2259,7 @@ class Runner:
                     args, sql, _ = items[i]
                     e = pickle.loads(pickle.dumps(module.parse_one(sql)))
                     if args.get("execute"):
-                        if module.transpile(sql, write="duckdb")[0] not in cache:
+                        if module.transpile(sql, write="duckdb")[0] != cache.get("__duck_sql_by_query__", {}).get(i):
                             bad.add(i)
                             need += qcost(i) if qcost else 0
                             continue
@@ -2640,6 +2663,17 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
         new_texts = {}
     cands = set(all_numbers) if an.everything else set(an.cands)
     cands |= set(mp.unknown_tests) if (an.cands or an.everything) else set()
+    setup_failures = set()
+    if len(new_texts) == 1 and not an.everything:
+        rel, source = next(iter(new_texts.items()))
+        if rel.startswith("tests/fixtures/optimizer/tpc-") and rel.endswith(".sql"):
+            import tpcds_replay as replay
+            omit, broken = replay.fixture_effect(REPO, rel, _old_text_of(rel), source)
+            cands.difference_update(mp.number_by_id[tid] for tid in omit if tid in mp.number_by_id)
+            if broken:
+                setup_failures = {n for n, t in by_number.items()
+                                  if t["id"].startswith("tests/test_executor.py::TestExecutor::")}
+                cands.difference_update(setup_failures)
     unit_filter = {}
     local_cpu = cpu_ms
     p_over = {}
@@ -2715,11 +2749,42 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
         local_cpu[un] = setup + (1 - p_u) * full + p_u * min(full, 1500)
         p_over[un] = p_u
     run, blind = choose(cands, ms, local_cpu, class_ms, by_number, an, p_over)
+    if len(new_texts) == 1 and not an.everything:
+        import tpcds_replay as replay
+        rel, source = next(iter(new_texts.items()))
+        mode = None
+        if rel == replay.FIXTURE and source is not None:
+            mode = "fixture"
+        elif rel.startswith("sqlglot/optimizer/") and source and an.swap and not an.non_body and not an.reimport:
+            rule = rel.rsplit("/", 1)[-1].removesuffix(".py")
+            if (rule in replay.RULES and os.path.isfile(os.path.join(replay.CACHE_DIR, rule + ".pkl"))
+                    and replay.local_edit(_old_text_of(rel), source)):
+                mode = "|".join([rule, *an.swap[module_name(rel)]])
+        if mode:
+            for n in mp.unit_test_nums & (blind | run):
+                if not by_number[n]["id"].endswith("::test_execute_tpcds"):
+                    continue
+                # If omitting the test barely changes the bill, just include it.
+                if n in blind and pack_cost(blind, ms) - pack_cost(blind - {n}, ms) < 4000:
+                    continue
+                fallback = []
+                if n in run and mode != "fixture":
+                    # A wide plan fingerprint reoptimizes each query from scratch.
+                    # Try the narrower rule boundary first and keep the original
+                    # verifier when the rule produces a different result.
+                    fallback = unit_filter.get(n, [])
+                    if sum(u.startswith("f") for u in fallback) < 24:
+                        continue
+                run.add(n)
+                blind.discard(n)
+                unit_filter[n] = ["replay:" + mode, *fallback]
+                an.reasons.append("TPC-DS replay " + mode)
     unit_filter = {k: v for k, v in unit_filter.items() if k in run}
     if an.import_check and not run and not an.everything:
         pick = min(cands, key=lambda n: cpu_ms[n]) if cands else min(all_numbers, key=lambda n: cpu_ms[n])
         run = {pick}
         blind.discard(pick)
+    blind.update(setup_failures)
     return {"id": cid, "an": an, "new": new_texts, "run": run, "blind": blind, "units": unit_filter, "cands": cands}
 
 

@@ -15,6 +15,10 @@ RUN mkdir -p /app/sqlglot \
 COPY build_tpcds_cache.py tpcds_fp.py /app/
 RUN cd /app/sqlglot && SKIP_INTEGRATION=0 python /app/build_tpcds_cache.py /app/sqlglot /app/tpcds_cache.pkl
 
+COPY build_fixture_reads.py build_ds_replay.py tpcds_replay.py syncpool.py /app/
+RUN OPENBLAS_NUM_THREADS=1 python /app/build_ds_replay.py /app/sqlglot /app/ds_replay \
+ && OPENBLAS_NUM_THREADS=1 python /app/build_fixture_reads.py /app/sqlglot /app/ds_replay/fixtures.json
+
 COPY blast.py syncpool.py token_coverage.py token_reads.json map.json.gz cpu.json /app/
 # marshal loads twice as fast as JSON; converting here keeps that CPU out of the scored run
 RUN python -c "import json,gzip,marshal; marshal.dump(json.load(gzip.open('/app/map.json.gz')), open('/app/map.marshal','wb'))" \
