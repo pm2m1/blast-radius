@@ -32,10 +32,77 @@ def _ser(node, out):
         out.append(type(node).__name__ + ":" + repr(node))
 
 
-def fingerprint(expression, schema_dict):
+def optimized(expression, schema_dict):
     from sqlglot.optimizer import optimize
     from sqlglot.schema import ensure_schema
-    tree = optimize(expression, ensure_schema(schema_dict, dialect=None), leave_tables_isolated=True, dialect=None)
+    return optimize(expression, ensure_schema(schema_dict, dialect=None), leave_tables_isolated=True, dialect=None)
+
+
+def tree_fingerprint(tree):
     out = []
     _ser(tree, out)
+    return hashlib.sha1("".join(out).encode()).hexdigest()
+
+
+def fingerprint(expression, schema_dict):
+    tree = optimized(expression, schema_dict)
+    out = []
+    _ser(tree, out)
+    return hashlib.sha1("".join(out).encode()).hexdigest()
+
+
+def plan_fingerprint(plan):
+    """Fingerprint of a planner DAG: every step's type and attributes; expressions via _ser."""
+    from sqlglot import exp
+    from sqlglot.planner import Step
+    order, ids, todo = [], {}, [plan.root]
+    while todo:
+        s = todo.pop()
+        if id(s) in ids:
+            continue
+        ids[id(s)] = len(order)
+        order.append(s)
+        todo.extend(sorted(s.dependencies, key=lambda d: (type(d).__name__, d.name or "")))
+
+    def ser(v, out):
+        if isinstance(v, (exp.Expr if hasattr(exp, "Expr") else exp.Expression)):
+            _ser(v, out)
+        elif isinstance(v, Step):
+            if id(v) not in ids:
+                ids[id(v)] = len(order)
+                order.append(v)
+            out.append("step#%d" % ids[id(v)])
+        elif isinstance(v, dict):
+            out.append("{")
+            for k in sorted(v, key=repr):
+                out.append(repr(k) + ":")
+                ser(v[k], out)
+                out.append(",")
+            out.append("}")
+        elif isinstance(v, (list, tuple)):
+            out.append("[")
+            for x in v:
+                ser(x, out)
+                out.append(",")
+            out.append("]")
+        elif isinstance(v, (set, frozenset)):
+            parts = []
+            for x in v:
+                o = []
+                ser(x, o)
+                parts.append("".join(o))
+            out.append("set(" + ",".join(sorted(parts)) + ")")
+        else:
+            out.append(type(v).__name__ + ":" + repr(v))
+    out = []
+    i = 0
+    while i < len(order):
+        s = order[i]
+        out.append("<%d %s " % (i, type(s).__name__))
+        for k in sorted(vars(s)):
+            out.append(k + "=")
+            ser(vars(s)[k], out)
+            out.append(";")
+        out.append(">")
+        i += 1
     return hashlib.sha1("".join(out).encode()).hexdigest()

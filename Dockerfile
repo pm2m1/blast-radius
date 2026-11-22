@@ -20,6 +20,8 @@ RUN OPENBLAS_NUM_THREADS=1 python /app/build_ds_replay.py /app/sqlglot /app/ds_r
  && OPENBLAS_NUM_THREADS=1 python /app/build_fixture_reads.py /app/sqlglot /app/ds_replay/fixtures.json
 
 COPY blast.py syncpool.py token_coverage.py token_reads.json map.json.gz cpu.json /app/
+# plan + code-generation profile of the pinned TPC-DS executor run (built offline by tools/build_codegen.py)
+COPY cg /app/cg
 # marshal loads twice as fast as JSON; converting here keeps that CPU out of the scored run
 RUN python -c "import json,gzip,marshal; marshal.dump(json.load(gzip.open('/app/map.json.gz')), open('/app/map.marshal','wb'))" \
  && python -m compileall -q /app/blast.py /app/syncpool.py /app/tpcds_fp.py && chmod -R a+rX /app

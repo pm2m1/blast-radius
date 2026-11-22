@@ -99,6 +99,7 @@ class Map:
             self.ar_import = set(self.ar["import"])
             self.ar_names = set(self.ar["names"]) - set(self.ar["dyn"])
         self._tpcds_rt = None
+        self._cg_lines = None
         self.wm = m.get("wm")
         if self.wm:
             self.wm_remap = [number_of.get(i) for i in self.wm["ids"]]
@@ -132,6 +133,20 @@ class Map:
         if sid is None:
             return set()
         return {self.ar_remap[i] for i in self.ar["sets"][sid] if self.ar_remap[i] is not None}
+
+    def codegen_lines(self):
+        """query index -> {"plan"|"cg"|"data": {rel: set(lines)}} (only replayable queries)."""
+        if self._cg_lines is None:
+            self._cg_lines = {}
+            try:
+                import gzip
+                with gzip.open(os.path.join(_HERE, "cg", "codegen_lines.json.gz"), "rt") as f:
+                    raw = json.load(f)
+                self._cg_lines = {int(q): {ph: {rel: set(ls) for rel, ls in d.items()} for ph, d in v.items()}
+                                  for q, v in raw.items()}
+            except Exception as e:
+                log("codegen profile unavailable:", repr(e)[:80])
+        return self._cg_lines
 
     def tpcds_rt(self):
         """query index -> {rel: set(lines run outside optimize())} for the TPC-DS executor test."""
@@ -2003,6 +2018,7 @@ class Runner:
         self.plans = plans
         self.by_number = {t["number"]: t for t in tests}
         self._duck_conn = None
+        self._cg = None
         os.environ.setdefault("SKIP_INTEGRATION", "0")
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import syncpool
@@ -2200,13 +2216,15 @@ class Runner:
         reused when the patched sqlglot emits exactly the pinned DuckDB SQL."""
         keep = None
         fq = []
+        gq = set()
         dq = []
         budget = None
         uc = {"q": {}, "setup": 1000}
         for n, us in (units or {}).items():
             if self.by_number[n]["id"].endswith("::test_execute_tpcds"):
                 keep = {int(u[1:]) for u in us if u.startswith("q")}
-                fq = [int(u[1:]) for u in us if u.startswith("f")]
+                fq = [int(u[1:]) for u in us if u.startswith("f") or u.startswith("g")]
+                gq = {int(u[1:]) for u in us if u.startswith("g")}
                 dq = [int(u[1:]) for u in us if u.startswith("d")]
                 budget = next((float(u[1:]) for u in us if u.startswith("b")), None)
                 uc = UNIT_COSTS.get(self.by_number[n]["id"]) or uc
@@ -2251,7 +2269,7 @@ class Runner:
             qcost = lambda q: uc["q"].get(str(q), UNIT_MS)  # noqa
             fq.sort(key=lambda q: -qcost(q))
             base = uc["setup"] + sum(qcost(q) for q in keep)
-            bad = self._tpcds_fp_check(module, fq, cache, base, qcost, budget)
+            bad = self._tpcds_fp_check(module, fq, cache, base, qcost, budget, gq)
             if bad is None:
                 log("tpcds fingerprint check: over budget, including the test")
                 return "include"
@@ -2347,7 +2365,32 @@ class Runner:
                 bad.add(i)
         return bad
 
-    def _tpcds_fp_check(self, module, idxs, cache, base=0.0, qcost=None, budget=None):
+    def _codegen_same(self, i, tree):
+        """The patched planner builds the pinned plan, and the patched code generator writes the
+        pinned Python code for every expression the pinned executor generated."""
+        import pickle
+        if self._cg is None:
+            import gzip
+            try:
+                with gzip.open(os.path.join(_HERE, "cg", "codegen.pkl.gz"), "rb") as f:
+                    self._cg = pickle.load(f)
+            except Exception:
+                self._cg = {}
+        rec = self._cg.get(i)
+        if not rec or not rec.get("ok") or not rec.get("plan"):
+            return False
+        import tpcds_fp
+        from sqlglot.planner import Plan
+        from sqlglot.executor.python import Python
+        if tpcds_fp.plan_fingerprint(Plan(tree)) != rec["plan"]:
+            return False
+        gen = Python().generator(identify=True, comments=False)
+        for blob, ga, gk, sql in rec["calls"]:
+            if gen.generate(pickle.loads(blob), *ga, **gk) != sql:
+                return False
+        return True
+
+    def _tpcds_fp_check(self, module, idxs, cache, base=0.0, qcost=None, budget=None, gq=()):
         """Queries whose patched parse / DuckDB SQL / optimized tree differ from the pinned commit
         (or that error or time out). The others reach the executor's runtime phase with identical
         input, and the caller already knows no changed line runs in that phase for them."""
@@ -2384,7 +2427,9 @@ class Runner:
                             bad.add(i)
                             need += qcost(i) if qcost else 0
                             continue
-                        if tpcds_fp.fingerprint(e, module.TPCDS_SCHEMA) != fps.get(i):
+                        tree = tpcds_fp.optimized(e, module.TPCDS_SCHEMA)
+                        if tpcds_fp.tree_fingerprint(tree) != fps.get(i) or \
+                                (i in gq and not self._codegen_same(i, tree)):
                             bad.add(i)
                             need += qcost(i) if qcost else 0
                 except FpTimeout:
@@ -2642,6 +2687,7 @@ UNIT_SETUP_MS = float(os.environ.get("UNIT_SETUP_MS", "2000"))
 UNIT_MS = float(os.environ.get("UNIT_MS", "400"))
 TPCDS_FP_LEVEL = os.environ.get("TPCDS_FP_LEVEL", "1") == "1"
 TPCDS_DUCK_LEVEL = os.environ.get("TPCDS_DUCK_LEVEL", "1") == "1"
+TPCDS_CG_LEVEL = os.environ.get("TPCDS_CG_LEVEL", "1") == "1"
 DUCK_BASE_MS = float(os.environ.get("DUCK_BASE_MS", "300"))
 DUCK_QUERY_MS = float(os.environ.get("DUCK_QUERY_MS", "4"))
 FP_BASE_MS = float(os.environ.get("FP_BASE_MS", "250"))
@@ -2830,20 +2876,31 @@ def plan_commit(mp, cid, text, ms, cpu_ms, class_ms, by_number, all_numbers):
                     continue
                 rt = mp.tpcds_rt()
                 changed = [(rel, l) for rel, ls in an.body_lines for l in ls]
-                E, F = [], []
+                E, F, G = [], [], []
+                cgl = mp.codegen_lines() if TPCDS_CG_LEVEL else {}
                 for u in us_fp:
                     if not u.startswith("q"):
                         E = None
                         break
                     q = int(u[1:])
                     r = rt.get(q)
-                    (E if r is not None and any(l in r.get(rel, ()) for rel, l in changed) else F).append(q)
+                    if r is None or not any(l in r.get(rel, ()) for rel, l in changed):
+                        F.append(q)
+                        continue
+                    ph = cgl.get(q)
+                    if ph is not None and not any(l in ph["data"].get(rel, ()) for rel, l in changed) and \
+                            all(l in ph["plan"].get(rel, ()) or l in ph["cg"].get(rel, ()) or
+                                l not in r.get(rel, ()) for rel, l in changed):
+                        G.append(q)  # only planning / code generation touched: replay them exactly
+                    else:
+                        E.append(q)
                 if E is not None:
                     if local_cpu is cpu_ms:
                         local_cpu = dict(cpu_ms)
                     budget = FP_EXEC_PASS * ms[un] / CPU_FACTOR
                     unit_filter[un] = ["q%d" % q for q in sorted(E)] + ["f%d" % q for q in sorted(F)] + \
-                        ["b%d" % budget]
+                        ["g%d" % q for q in sorted(G)] + ["b%d" % budget]
+                    F = F + G
                     uc = UNIT_COSTS.get(tid) or {"q": {}, "setup": 1000}
                     total_units = max(1, mp.unit_count(un))
                     full = sum(uc["q"].get(str(q), UNIT_MS) for q in E)
