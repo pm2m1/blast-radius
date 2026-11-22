@@ -1,0 +1,298 @@
+{
+  "NUMERIC_ESCAPES": {
+    "owners": [
+      "sqlglot.dialects.bigquery:BigQuery.Tokenizer",
+      "sqlglot.dialects.clickhouse:ClickHouse.Tokenizer",
+      "sqlglot.dialects.duckdb:DuckDB.Tokenizer",
+      "sqlglot.dialects.hive:Hive.Tokenizer",
+      "sqlglot.dialects.materialize:Materialize.Tokenizer",
+      "sqlglot.dialects.postgres:Postgres.Tokenizer",
+      "sqlglot.dialects.redshift:Redshift.Tokenizer",
+      "sqlglot.dialects.snowflake:Snowflake.Tokenizer",
+      "sqlglot.dialects.spark:Spark.Tokenizer",
+      "sqlglot.tokens:Tokenizer"
+    ],
+    "reads": {
+      "sqlglot.dialects.bigquery:BigQuery.Tokenizer": {
+        "\"": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery"
+        ],
+        "'": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_byte_strings",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_errors"
+        ],
+        "\\": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_byte_strings",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_like_escape",
+          "tests/dialects/test_dialect.py::TestDialect::test_initcap"
+        ],
+        "`": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes"
+        ],
+        "a": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes"
+        ],
+        "b": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes"
+        ],
+        "f": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes"
+        ],
+        "n": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_byte_strings",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_like_escape",
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb"
+        ],
+        "r": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes"
+        ],
+        "t": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes"
+        ],
+        "u": [
+          "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs"
+        ],
+        "v": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes"
+        ],
+        "x": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_byte_strings",
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_identifier_escapes",
+          "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs"
+        ]
+      },
+      "sqlglot.dialects.clickhouse:ClickHouse.Tokenizer": {
+        "\"": [
+          "tests/dialects/test_dialect.py::TestDialect::test_escaped_identifier_delimiter"
+        ],
+        "'": [
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_clickhouse"
+        ],
+        "0": [
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_clickhouse"
+        ],
+        "\\": [
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_clickhouse",
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_string_split"
+        ],
+        "`": [
+          "tests/dialects/test_dialect.py::TestDialect::test_escaped_identifier_delimiter"
+        ]
+      },
+      "sqlglot.dialects.duckdb:DuckDB.Tokenizer": {
+        "'": [
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb"
+        ],
+        "n": [
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb"
+        ],
+        "t": [
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb"
+        ]
+      },
+      "sqlglot.dialects.hive:Hive.Tokenizer": {
+        "\n": [
+          "tests/dialects/test_hive.py::TestHive::test_escapes"
+        ],
+        "\"": [
+          "tests/dialects/test_athena.py::TestAthena::test_ddl",
+          "tests/dialects/test_athena.py::TestAthena::test_tokenizer_errors"
+        ],
+        "'": [
+          "tests/dialects/test_athena.py::TestAthena::test_ddl",
+          "tests/dialects/test_athena.py::TestAthena::test_tokenizer_errors",
+          "tests/dialects/test_hive.py::TestHive::test_ddl",
+          "tests/dialects/test_hive.py::TestHive::test_quotes"
+        ],
+        "U": [
+          "tests/dialects/test_spark.py::TestSpark::test_string_escapes"
+        ],
+        "\\": [
+          "tests/dialects/test_athena.py::TestAthena::test_ddl",
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_string_split",
+          "tests/dialects/test_hive.py::TestHive::test_escapes",
+          "tests/dialects/test_hive.py::TestHive::test_quotes"
+        ],
+        "n": [
+          "tests/dialects/test_hive.py::TestHive::test_escapes"
+        ]
+      },
+      "sqlglot.dialects.postgres:Postgres.Tokenizer": {
+        "'": [
+          "tests/dialects/test_postgres.py::TestPostgres::test_postgres"
+        ],
+        "0": [
+          "tests/dialects/test_postgres.py::TestPostgres::test_postgres"
+        ],
+        "n": [
+          "tests/dialects/test_postgres.py::TestPostgres::test_postgres"
+        ],
+        "t": [
+          "tests/dialects/test_postgres.py::TestPostgres::test_postgres"
+        ],
+        "x": [
+          "tests/dialects/test_postgres.py::TestPostgres::test_postgres"
+        ]
+      },
+      "sqlglot.dialects.redshift:Redshift.Tokenizer": {
+        "\\": [
+          "tests/dialects/test_redshift.py::TestRedshift::test_identity"
+        ]
+      },
+      "sqlglot.dialects.snowflake:Snowflake.Tokenizer": {
+        "'": [
+          "tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake"
+        ],
+        "\\": [
+          "tests/dialects/test_dialect.py::TestDialect::test_initcap",
+          "tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake"
+        ],
+        "n": [
+          "tests/dialects/test_snowflake.py::TestSnowflake::test_user_defined_functions"
+        ]
+      },
+      "sqlglot.dialects.spark:Spark.Tokenizer": {
+        "U": [
+          "tests/dialects/test_spark.py::TestSpark::test_string_escapes"
+        ],
+        "\\": [
+          "tests/dialects/test_spark.py::TestSpark::test_spark"
+        ],
+        "n": [
+          "tests/dialects/test_spark.py::TestSpark::test_transform_query"
+        ],
+        "t": [
+          "tests/dialects/test_spark.py::TestSpark::test_transform_query"
+        ]
+      }
+    },
+    "unobserved": []
+  },
+  "NUMERIC_LITERALS": {
+    "owners": [
+      "sqlglot.dialects.athena:Athena.Tokenizer",
+      "sqlglot.dialects.hive:Hive.Tokenizer",
+      "sqlglot.tokens:Tokenizer"
+    ],
+    "reads": {
+      "*": {
+        "A": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_hive.py::TestHive::test_hive"
+        ],
+        "AB": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery"
+        ],
+        "ABCDEF0123456789ABCDEF": [
+          "tests/dialects/test_starrocks.py::TestStarrocks::test_command_statements"
+        ],
+        "A_1A": [
+          "tests/dialects/test_hive.py::TestHive::test_hive"
+        ],
+        "A_FLAG": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery"
+        ],
+        "B": [
+          "tests/test_expressions.py::TestExprs::test_table_name"
+        ],
+        "B1010": [
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb"
+        ],
+        "BD": [
+          "tests/dialects/test_dialect.py::TestDialect::test_decimal_literals",
+          "tests/dialects/test_dialect.py::TestDialect::test_spark2_negative_scale_decimal_literals",
+          "tests/dialects/test_hive.py::TestHive::test_cast"
+        ],
+        "D": [
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_cast",
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb",
+          "tests/dialects/test_mysql.py::TestMySQL::test_ddl"
+        ],
+        "DAY": [
+          "tests/dialects/test_postgres.py::TestPostgres::test_postgres",
+          "tests/test_expressions.py::TestExprs::test_to_interval"
+        ],
+        "E_5": [
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_number_like_identifiers",
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_digit_separators"
+        ],
+        "E_5FOO": [
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_number_like_identifiers"
+        ],
+        "F": [
+          "tests/dialects/test_mysql.py::TestMySQL::test_ddl"
+        ],
+        "K": [
+          "tests/dialects/test_oracle.py::TestOracle::test_create_table_storage"
+        ],
+        "L": [
+          "tests/dialects/test_hive.py::TestHive::test_cast"
+        ],
+        "M": [
+          "tests/dialects/test_oracle.py::TestOracle::test_create_table_storage"
+        ],
+        "S": [
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb",
+          "tests/dialects/test_hive.py::TestHive::test_cast"
+        ],
+        "SOMERANDOMTEXT": [
+          "tests/test_jsonpath.py::TestJsonpath::test_cts_file"
+        ],
+        "START": [
+          "tests/dialects/test_oracle.py::TestOracle::test_connect_by"
+        ],
+        "T": [
+          "tests/dialects/test_databricks.py::TestDatabricks::test_optimize"
+        ],
+        "X": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_postgres.py::TestPostgres::test_postgres"
+        ],
+        "Y": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_hive.py::TestHive::test_cast"
+        ],
+        "_": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_number_like_identifiers",
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_digit_separators"
+        ],
+        "_2": [
+          "tests/dialects/test_hive.py::TestHive::test_hive"
+        ],
+        "_5": [
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_digit_separators"
+        ],
+        "_A": [
+          "tests/dialects/test_hive.py::TestHive::test_hive"
+        ],
+        "_B": [
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_clickhouse"
+        ],
+        "_Y": [
+          "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery"
+        ],
+        "__2": [
+          "tests/dialects/test_clickhouse.py::TestClickhouse::test_number_like_identifiers",
+          "tests/dialects/test_duckdb.py::TestDuckDB::test_digit_separators"
+        ],
+        "\u00caSS": [
+          "tests/test_transpile.py::TestTranspile::test_weird_chars"
+        ]
+      }
+    },
+    "unobserved": []
+  }
+}

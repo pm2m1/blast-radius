@@ -73,6 +73,9 @@ class Map:
         # map-build ids -> numbers in this tests.json
         number = {t["id"]: t["number"] for t in tests}
         self.remap = [number.get(i) for i in m["ids"]]
+        self.number_by_id = number
+        with open(os.path.join(_HERE, "token_reads.json")) as stream:
+            self.token_reads = json.load(stream)
         self.lines = m["lines"]
         self.imp = {f: set(v) for f, v in m["imp"].items()}
         self.by_file = {}
@@ -1844,6 +1847,21 @@ def analyze_commit(mp, patch_text):
                 analyze_py(an, fp.old, old_text, None, _tree_cache)
         new_texts[rel] = new_text
         base = os.path.basename(rel)
+        if (len(files) == 1 and fp.old == fp.new and old_text and new_text and
+                rel.startswith("sqlglot/dialects/") and rel.endswith(".py") and
+                any(field in old_text for field in mp.token_reads)):
+            from token_coverage import changed_reads
+            tree = old_tree_of(rel)
+            match = changed_reads(mp.token_reads, module_name(rel), old_text, new_text, tree) if tree else None
+            if match is not None:
+                field, ids = match
+                readers = {mp.number_by_id[t] for t in ids if t in mp.number_by_id}
+                readers.update(mp.opens(rel))
+                readers.update(mention_word_tests(mp, field))
+                readers.update(mp.unknown_tests)
+                an.non_body = an.reimport = True
+                an.add(readers, "tokenizer lookup coverage")
+                continue
         if rel in CONFIG_FILES or base == "conftest.py":
             if "pytest" in patch_text or base == "conftest.py":
                 an.all("pytest config " + rel)
@@ -2583,24 +2601,32 @@ def pack(numbers, ms):
     if not numbers:
         return []
     items = sorted(numbers, key=lambda n: -ms[n])
-    best = None
-    if 2 <= len(items) <= 400 and sum(ms[n] for n in items) <= 200000:
-        bins = _best_two_way(items, ms)
-        cost = max(sum(ms[n] for n in b) for b in bins) + 4000
-        best = (cost, bins)
-    for k in range(1, 9):
-        if k > len(items):
+    total = sum(ms[n] for n in items)
+    longest = ms[items[0]]
+    best_cost = total + 2000
+    best_bins = [items]
+    for k in range(2, min(8, len(items)) + 1):
+        # Adding workers can never shorten the longest test; the average load
+        # is a second lower bound. Do no construction for dominated counts.
+        if longest + 2000 * k >= best_cost:
             break
-        loads = [0] * k
-        bins = [[] for _ in range(k)]
-        for n in items:
-            i = loads.index(min(loads))
-            loads[i] += ms[n]
-            bins[i].append(n)
-        cost = max(loads) + 2000 * k
-        if best is None or cost < best[0]:
-            best = (cost, bins)
-    return [b for b in best[1] if b]
+        if (total + k - 1) // k + 2000 * k >= best_cost:
+            continue
+        if k == 2 and len(items) <= 400 and total <= 200000:
+            bins = _best_two_way(items, ms)
+            load = max(sum(ms[n] for n in b) for b in bins)
+        else:
+            loads = [0] * k
+            bins = [[] for _ in range(k)]
+            for n in items:
+                i = loads.index(min(loads))
+                loads[i] += ms[n]
+                bins[i].append(n)
+            load = max(loads)
+        cost = load + 2000 * k
+        if cost < best_cost:
+            best_cost, best_bins = cost, bins
+    return [b for b in best_bins if b]
 
 
 # --------------------------------------------------------------------------- main

@@ -24,3 +24,24 @@ operators, a test whose run never saw a difference is unaffected, step for step,
 Anything uncertain widens the selection. No answers are precomputed per patch.
 
 Rebuild the map: see `tools/build_map.py` (runs sqlglot's suite under coverage).
+
+### Tokenizer lookup coverage
+
+A value-only change to a literal tokenizer dictionary can preserve its keys,
+order, and truth value. In the pinned Python tokenizer, numeric escape values
+are consumed at two dictionary lookups, and numeric suffix values at one.
+The dialect metaclass and generator also inspect escape key membership or
+dictionary truth. Those observations remain equal for this restricted edit.
+
+`token_reads.json` records the keys observed by baseline tests at the value
+lookups. Escape mappings are tracked by object identity across inheritance.
+Suffix observations are combined across dialects because some dialects copy
+and merge these dictionaries. Source readers, tests that mention the field,
+unrecognized tests, and tests with unresolved line coverage are retained.
+Other edits use the ordinary selector, including changes to keys, compound
+patches, and dictionaries with computed entries.
+
+To rebuild the observations with Python 3.13 and the locked dependencies, run
+`python tools/build_token_reads.py /path/to/pinned/sqlglot map.json.gz token_reads.json`.
+The builder chooses tests using the existing base-commit line coverage and
+requires them to pass. The selector reads only the resulting map at run time.
