@@ -2946,7 +2946,7 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
-PROBE = "tp_nb"
+PROBE = "tp_rt"
 
 
 def main():
