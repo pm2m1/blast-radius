@@ -2739,6 +2739,9 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
+PROBE = "all"
+
+
 def main():
     out = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)  # anything else printed to stdout goes to stderr
@@ -2810,8 +2813,16 @@ def main():
             res = None
         failed = finish_result(p, res, mp, all_numbers)
         p["failed"] = failed
+    probe_tests = {"maxnodes": "::test_max_nodes", "tpcds": "::test_execute_tpcds"}
     for p in plans:
         sel = set(p.get("failed", set())) | p["blind"]
+        # PROBE (diagnostic builds only): blank one category to measure its cost on the hidden batch
+        if PROBE == "all" and (p["an"].everything or len(sel) > 1000):
+            sel = set()
+        elif PROBE in probe_tests:
+            for n in list(sel):
+                if by_number[n]["id"].endswith(probe_tests[PROBE]) and n not in p.get("failed", set()):
+                    sel.discard(n)
         out.write(json.dumps({"commit": p["id"], "workers": pack(sel, ms)}) + "\n")
         if DEBUG:
             log(p["id"], p.get("mode"), "run", len(p["run"]), "est_ms", int(sum(cpu_ms[n] for n in p["run"])),
