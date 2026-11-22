@@ -35,6 +35,7 @@ for i, (args, sql, _) in enumerate(cls.tpcds_sqls):
             print("no fingerprint", i, type(e).__name__, file=sys.stderr)
 cache["__fp__"] = fps
 cache["__duck__"] = duck
+cache["__duck_sql_by_query__"] = duck
 with open(out, "wb") as f:
     pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
 print("tpcds cache:", len(cache), "queries", os.path.getsize(out), "bytes", file=sys.stderr)

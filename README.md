@@ -45,3 +45,25 @@ To rebuild the observations with Python 3.13 and the locked dependencies, run
 `python tools/build_token_reads.py /path/to/pinned/sqlglot map.json.gz token_reads.json`.
 The builder chooses tests using the existing base-commit line coverage and
 requires them to pass. The selector reads only the resulting map at run time.
+
+### Verifying the expensive TPC tests
+
+The Docker build runs the pinned TPC-DS executor test and records inputs and
+outputs at nine optimizer passes. For a single optimizer file with only a
+literal or operator change in a function body, the selector can replay the
+patched pass on the inputs that reached that function. It checks expression
+types, ordered arguments, metadata, comments and parent links. If the output
+changes, an observed use falls outside the pass, or verification exceeds its
+budget, the test stays eligible. Cached DuckDB SQL used for a query fingerprint
+must match the baseline SQL for that same query index.
+
+For a change to a TPC-H or TPC-DS SQL fixture, the selector first runs the
+pinned fixture reader on the edited file. Errors in shared setup retain the
+whole executor class. Otherwise, a build-time profile identifies which
+executor methods read the affected fixture. On a TPC-DS input change the
+selector can execute the edited queries through the original test. The executor
+ignores expected SQL, while the optimizer test checks it, so those tests can
+receive different decisions for the same edit.
+
+The Dockerfile builds the profiles from the pinned SQLGlot source. The generated
+checkpoints and any evaluation patches are external to the submitted repository.
