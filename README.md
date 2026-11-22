@@ -1,4 +1,4 @@
-# Blast Radius entry
+# Blast Radius entry(Hackathon Builders)
 
 `blast.py` picks, for each sqlglot patch, the tests that can fail.
 
