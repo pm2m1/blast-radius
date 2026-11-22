@@ -2946,6 +2946,9 @@ def finish_result(p, res, mp, all_numbers):
     return failed
 
 
+PROBE = "tp_nb"
+
+
 def main():
     out = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)  # anything else printed to stdout goes to stderr
@@ -3017,8 +3020,26 @@ def main():
             res = None
         failed = finish_result(p, res, mp, all_numbers)
         p["failed"] = failed
+    rt = mp.tpcds_rt() or {}
+    rt_all = {}
+    for q, v in rt.items():
+        for f, ls in v.items():
+            rt_all.setdefault(f, set()).update(ls)
     for p in plans:
         sel = set(p.get("failed", set())) | p["blind"]
+        # PROBE (diagnostic builds only): drop an unverified test_execute_tpcds for one class of commit
+        if PROBE:
+            an = p["an"]
+            if an.non_body or not an.body_lines:
+                kind = "tp_nb"
+            elif any(l in rt_all.get(rel, ()) for rel, ls in an.body_lines for l in ls):
+                kind = "tp_rt"
+            else:
+                kind = "tp_body"
+            if kind == PROBE:
+                for n in list(sel):
+                    if by_number[n]["id"].endswith("::test_execute_tpcds") and n not in p.get("failed", set()):
+                        sel.discard(n)
         out.write(json.dumps({"commit": p["id"], "workers": pack(sel, ms)}) + "\n")
         if DEBUG:
             log(p["id"], p.get("mode"), "run", len(p["run"]), "est_ms", int(sum(cpu_ms[n] for n in p["run"])),
